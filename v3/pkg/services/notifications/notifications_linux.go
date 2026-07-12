@@ -629,6 +629,14 @@ func (ln *linuxNotifier) handleActionInvoked(signal *dbus.Signal) {
 // 2 - dismissed by user (click on X)
 // 3 - closed by CloseNotification call
 // 4 - undefined/reserved
+//
+// No NotificationResponse is emitted for any close reason: dismissal is not
+// activation. Real activations arrive via ActionInvoked. Synthesizing a
+// DefaultActionIdentifier response on reason 2 (as earlier versions did) made
+// a dismissal indistinguishable from a genuine default-action click, so apps
+// navigated on dismiss. Windows emits nothing on toast dismissal and macOS
+// only forwards the distinct UNNotificationDismissActionIdentifier when a
+// category explicitly opts in — emitting nothing here matches both.
 func (ln *linuxNotifier) handleNotificationClosed(signal *dbus.Signal) {
 	if len(signal.Body) < 2 {
 		return
@@ -639,41 +647,9 @@ func (ln *linuxNotifier) handleNotificationClosed(signal *dbus.Signal) {
 		return
 	}
 
-	reason, ok := signal.Body[1].(uint32)
-	if !ok {
-		reason = 0 // Unknown reason
-	}
-
 	ln.notificationsLock.Lock()
-	notification, exists := ln.notifications[dbusID]
-	if exists {
-		delete(ln.notifications, dbusID)
-	}
+	delete(ln.notifications, dbusID)
 	ln.notificationsLock.Unlock()
-
-	if !exists {
-		return
-	}
-
-	if reason == 2 {
-		response := NotificationResponse{
-			ID:               notification.ID,
-			ActionIdentifier: DefaultActionIdentifier,
-			Title:            notification.Title,
-			Subtitle:         notification.Subtitle,
-			Body:             notification.Body,
-			CategoryID:       notification.CategoryID,
-			UserInfo:         notification.Data,
-		}
-
-		result := NotificationResult{
-			Response: response,
-		}
-
-		if ns := getNotificationService(); ns != nil {
-			ns.handleNotificationResult(result)
-		}
-	}
 }
 
 // isImagePath reports whether path has an extension recognised as an image by
