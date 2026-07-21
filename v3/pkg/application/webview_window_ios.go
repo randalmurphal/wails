@@ -435,6 +435,14 @@ func (w *iosWebviewWindow) snapAssist() {
 	// iOS doesn't support window snap assist like Windows
 }
 
+func (w *iosWebviewWindow) suspendWebview() {
+	// iOS has no WebView2 suspend equivalent
+}
+
+func (w *iosWebviewWindow) resumeWebview() {
+	// iOS has no WebView2 suspend equivalent
+}
+
 func newWindowImpl(parent *WebviewWindow) *iosWebviewWindow {
 	// Create iOS WebView implementation but don't create native view yet
 	// It will be created when run() is called

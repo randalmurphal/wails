@@ -375,3 +375,11 @@ func (w *androidWebviewWindow) showMenuBar() {
 func (w *androidWebviewWindow) snapAssist() {
 	// Android doesn't support window snap assist like Windows
 }
+
+func (w *androidWebviewWindow) suspendWebview() {
+	// Android has no WebView2 suspend equivalent
+}
+
+func (w *androidWebviewWindow) resumeWebview() {
+	// Android has no WebView2 suspend equivalent
+}
