@@ -57,6 +57,46 @@ func (i *ICoreWebView2_3) SetVirtualHostNameToFolderMapping(hostName, folderPath
 	return nil
 }
 
+// TrySuspend asks the browser to suspend the WebView to reduce memory
+// (script, layout and rendering stop; most renderer caches are purged).
+// The controller's IsVisible must already be false — a visible WebView
+// fails with ERROR_INVALID_STATE. The outcome is delivered through
+// handler; the HRESULT here only covers dispatching the request.
+func (i *ICoreWebView2_3) TrySuspend(handler *iCoreWebView2TrySuspendCompletedHandler) error {
+	hr, _, _ := i.vtbl.TrySuspend.Call(
+		uintptr(unsafe.Pointer(i)),
+		uintptr(unsafe.Pointer(handler)),
+	)
+	if windows.Handle(hr) != windows.S_OK {
+		return windows.Errno(hr)
+	}
+
+	return nil
+}
+
+// Resume resumes a suspended WebView. No-op success when not suspended.
+func (i *ICoreWebView2_3) Resume() error {
+	hr, _, _ := i.vtbl.Resume.Call(uintptr(unsafe.Pointer(i)))
+	if windows.Handle(hr) != windows.S_OK {
+		return windows.Errno(hr)
+	}
+
+	return nil
+}
+
+func (i *ICoreWebView2_3) GetIsSuspended() (bool, error) {
+	var suspended int32
+	hr, _, _ := i.vtbl.GetIsSuspended.Call(
+		uintptr(unsafe.Pointer(i)),
+		uintptr(unsafe.Pointer(&suspended)),
+	)
+	if windows.Handle(hr) != windows.S_OK {
+		return false, windows.Errno(hr)
+	}
+
+	return suspended != 0, nil
+}
+
 func (i *ICoreWebView2) GetICoreWebView2_3() *ICoreWebView2_3 {
 	var result *ICoreWebView2_3
 

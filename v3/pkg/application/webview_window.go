@@ -114,6 +114,8 @@ type (
 		toggleMenuBar()
 		setMenu(menu *Menu)
 		snapAssist()
+		suspendWebview()
+		resumeWebview()
 		setContentProtection(enabled bool)
 		attachModal(modalWindow *WebviewWindow)
 	}
@@ -476,6 +478,31 @@ func (w *WebviewWindow) Hide() Window {
 	w.options.Hidden = true
 	if w.impl != nil {
 		InvokeSync(w.impl.hide)
+	}
+	return w
+}
+
+// SuspendWebview hides the window's webview surface and asks the
+// browser engine to suspend the page, releasing most of its renderer
+// and compositor memory. Intended for minimised windows: the Windows
+// implementation refuses when the window is not minimised (WebView2
+// requires the webview hidden to suspend, and hiding it under a
+// visible window would blank it). Reverse with ResumeWebview.
+// Windows-only; no-op on other platforms.
+func (w *WebviewWindow) SuspendWebview() Window {
+	if w.impl != nil && !w.isDestroyed() {
+		InvokeSync(w.impl.suspendWebview)
+	}
+	return w
+}
+
+// ResumeWebview resumes a webview suspended by SuspendWebview and
+// re-shows its surface. Safe to call unconditionally on window
+// restore — both steps are no-ops when nothing was suspended.
+// Windows-only; no-op on other platforms.
+func (w *WebviewWindow) ResumeWebview() Window {
+	if w.impl != nil && !w.isDestroyed() {
+		InvokeSync(w.impl.resumeWebview)
 	}
 	return w
 }

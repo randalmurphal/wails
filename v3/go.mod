@@ -161,3 +161,5 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	mvdan.cc/sh/v3 v3.12.0 // indirect
 )
+
+replace github.com/wailsapp/wails/webview2 => ../webview2

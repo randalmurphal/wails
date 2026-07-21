@@ -2342,6 +2342,16 @@ func (w *windowsWebviewWindow) setupChromium() {
 	chromium.NavigationCompletedCallback = w.navigationCompleted
 	chromium.AcceleratorKeyCallback = w.processKeyBinding
 	chromium.ProcessFailedCallback = w.processFailed
+	chromium.TrySuspendCompletedCallback = func(errorCode uintptr, isSuccessful bool) {
+		// isSuccessful=false with S_OK means the browser declined (open
+		// DevTools, pending navigation) — expected, not an error. The
+		// webview stays hidden either way; resumeWebview re-shows it.
+		if errorCode != 0 {
+			globalApplication.error("webview suspend failed: HRESULT 0x%x", errorCode)
+		} else if !isSuccessful {
+			globalApplication.debug("webview suspend declined by browser", "window", w.parent.id)
+		}
+	}
 
 	chromium.Embed(w.hwnd)
 
@@ -2859,6 +2869,41 @@ func (w *windowsWebviewWindow) snapAssist() {
 	w32.KeybdEvent(byte('Z'), 0, w32.KEYEVENTF_KEYUP, 0)
 	// Release Windows key
 	w32.KeybdEvent(byte(w32.VK_LWIN), 0, w32.KEYEVENTF_KEYUP, 0)
+}
+
+// suspendWebview hides the WebView2 surface and asks the browser to
+// suspend the page, releasing most renderer and compositor memory.
+// Only meaningful while the window is minimised: WebView2's TrySuspend
+// requires the controller to be invisible, and hiding the controller
+// under a user-visible window would blank it — so a late-firing caller
+// (window already restored) is refused here rather than trusted to
+// have checked. Runs on the main thread via the public wrapper.
+func (w *windowsWebviewWindow) suspendWebview() {
+	if !w.isMinimised() {
+		globalApplication.debug("suspendWebview skipped: window not minimised", "window", w.parent.id)
+		return
+	}
+	if err := w.chromium.Hide(); err != nil {
+		globalApplication.error("suspendWebview: hide webview: %s", err)
+		return
+	}
+	if err := w.chromium.TrySuspend(); err != nil {
+		globalApplication.error("suspendWebview: TrySuspend: %s", err)
+		// The webview stays hidden — resumeWebview's Show reverses it on
+		// restore regardless of suspend state.
+	}
+}
+
+// resumeWebview resumes a suspended WebView2 and re-shows its surface.
+// Safe to call when not suspended (both steps are no-op successes), so
+// callers can invoke it unconditionally on window restore.
+func (w *windowsWebviewWindow) resumeWebview() {
+	if err := w.chromium.Resume(); err != nil {
+		globalApplication.error("resumeWebview: Resume: %s", err)
+	}
+	if err := w.chromium.Show(); err != nil {
+		globalApplication.error("resumeWebview: show webview: %s", err)
+	}
 }
 
 func (w *windowsWebviewWindow) setContentProtection(enabled bool) {

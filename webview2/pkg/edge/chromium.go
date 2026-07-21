@@ -67,6 +67,7 @@ type Chromium struct {
 	acceleratorKeyPressed            *ICoreWebView2AcceleratorKeyPressedEventHandler
 	navigationCompleted              *ICoreWebView2NavigationCompletedEventHandler
 	processFailed                    *ICoreWebView2ProcessFailedEventHandler
+	trySuspendCompleted              *iCoreWebView2TrySuspendCompletedHandler
 
 	environment            *ICoreWebView2Environment
 	webview2RuntimeVersion string
@@ -87,6 +88,7 @@ type Chromium struct {
 	WebResourceRequestedCallback             func(request *ICoreWebView2WebResourceRequest, args *ICoreWebView2WebResourceRequestedEventArgs)
 	NavigationCompletedCallback              func(sender *ICoreWebView2, args *ICoreWebView2NavigationCompletedEventArgs)
 	ProcessFailedCallback                    func(sender *ICoreWebView2, args *ICoreWebView2ProcessFailedEventArgs)
+	TrySuspendCompletedCallback              func(errorCode uintptr, isSuccessful bool)
 	ContainsFullScreenElementChangedCallback func(sender *ICoreWebView2, args *ICoreWebView2ContainsFullScreenElementChangedEventArgs)
 	AcceleratorKeyCallback                   func(uint) bool
 
@@ -121,6 +123,7 @@ func NewChromium() *Chromium {
 	e.acceleratorKeyPressed = newICoreWebView2AcceleratorKeyPressedEventHandler(e)
 	e.navigationCompleted = newICoreWebView2NavigationCompletedEventHandler(e)
 	e.processFailed = newICoreWebView2ProcessFailedEventHandler(e)
+	e.trySuspendCompleted = newICoreWebView2TrySuspendCompletedHandler(e)
 	e.containsFullScreenElementChanged = newICoreWebView2ContainsFullScreenElementChangedEventHandler(e)
 	/*
 		// Pinner seems to panic in some cases as reported on Discord, maybe during shutdown when GC detects pinned objects
@@ -586,6 +589,53 @@ func (e *Chromium) ProcessFailed(sender *ICoreWebView2, args *ICoreWebView2Proce
 		e.ProcessFailedCallback(sender, args)
 	}
 	return 0
+}
+
+func (e *Chromium) TrySuspendCompleted(errorCode uintptr, isSuccessful bool) uintptr {
+	if e.TrySuspendCompletedCallback != nil {
+		e.TrySuspendCompletedCallback(errorCode, isSuccessful)
+	}
+	return 0
+}
+
+// TrySuspend asks the browser to suspend the WebView, dropping most of
+// its renderer and compositor memory. The WebView must be hidden first
+// (call Hide()); a visible WebView fails with ERROR_INVALID_STATE. The
+// async outcome is reported via TrySuspendCompletedCallback. Requires
+// WebView2 Runtime 1.0.865+ (ICoreWebView2_3); older runtimes error.
+func (e *Chromium) TrySuspend() error {
+	if !e.IsReady() {
+		return errors.New("webview not ready")
+	}
+	wv3 := e.webview.GetICoreWebView2_3()
+	if wv3 == nil {
+		return errors.New("ICoreWebView2_3 unavailable (WebView2 Runtime too old)")
+	}
+	return wv3.TrySuspend(e.trySuspendCompleted)
+}
+
+// Resume resumes a suspended WebView. Success no-op when not suspended.
+func (e *Chromium) Resume() error {
+	if !e.IsReady() {
+		return errors.New("webview not ready")
+	}
+	wv3 := e.webview.GetICoreWebView2_3()
+	if wv3 == nil {
+		return errors.New("ICoreWebView2_3 unavailable (WebView2 Runtime too old)")
+	}
+	return wv3.Resume()
+}
+
+// IsSuspended reports whether the WebView is currently suspended.
+func (e *Chromium) IsSuspended() (bool, error) {
+	if !e.IsReady() {
+		return false, errors.New("webview not ready")
+	}
+	wv3 := e.webview.GetICoreWebView2_3()
+	if wv3 == nil {
+		return false, errors.New("ICoreWebView2_3 unavailable (WebView2 Runtime too old)")
+	}
+	return wv3.GetIsSuspended()
 }
 
 func (e *Chromium) NotifyParentWindowPositionChanged() error {
