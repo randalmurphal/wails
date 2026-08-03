@@ -2,6 +2,8 @@
 
 package edge
 
+import "strconv"
+
 type COREWEBVIEW2_PROCESS_FAILED_KIND uint32
 
 const (
@@ -16,11 +18,9 @@ const (
 	COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED = 1
 
 	// Indicates that the main frame's render process is unresponsive.
-	//
-	// Note that this does not seem to work right now.
-	// Does not fire for simple long running script case, the only related test
-	// SitePerProcessBrowserTest::NoCommitTimeoutForInvisibleWebContents is
-	// disabled.
+	// WebView2 re-raises this roughly every 30 seconds for as long as the
+	// renderer stays unresponsive. Observed in the wild with a renderer main
+	// thread blocked in a native wait (near-idle CPU, WebView2 150).
 	COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE = 2
 
 	// Indicates that a frame-only render process ended unexpectedly. The process
@@ -47,3 +47,30 @@ const (
 	// Indicates that a process of unspecified kind ended unexpectedly.
 	COREWEBVIEW2_PROCESS_FAILED_KIND_UNKNOWN_PROCESS_EXITED = 9
 )
+
+// String returns the SDK constant suffix for the failure kind, for logs.
+func (k COREWEBVIEW2_PROCESS_FAILED_KIND) String() string {
+	switch k {
+	case COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED:
+		return "BROWSER_PROCESS_EXITED"
+	case COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED:
+		return "RENDER_PROCESS_EXITED"
+	case COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE:
+		return "RENDER_PROCESS_UNRESPONSIVE"
+	case COREWEBVIEW2_PROCESS_FAILED_KIND_FRAME_RENDER_PROCESS_EXITED:
+		return "FRAME_RENDER_PROCESS_EXITED"
+	case COREWEBVIEW2_PROCESS_FAILED_KIND_UTILITY_PROCESS_EXITED:
+		return "UTILITY_PROCESS_EXITED"
+	case COREWEBVIEW2_PROCESS_FAILED_KIND_SANDBOX_HELPER_PROCESS_EXITED:
+		return "SANDBOX_HELPER_PROCESS_EXITED"
+	case COREWEBVIEW2_PROCESS_FAILED_KIND_GPU_PROCESS_EXITED:
+		return "GPU_PROCESS_EXITED"
+	case COREWEBVIEW2_PROCESS_FAILED_KIND_PPAPI_PLUGIN_PROCESS_EXITED:
+		return "PPAPI_PLUGIN_PROCESS_EXITED"
+	case COREWEBVIEW2_PROCESS_FAILED_KIND_PPAPI_BROKER_PROCESS_EXITED:
+		return "PPAPI_BROKER_PROCESS_EXITED"
+	case COREWEBVIEW2_PROCESS_FAILED_KIND_UNKNOWN_PROCESS_EXITED:
+		return "UNKNOWN_PROCESS_EXITED"
+	}
+	return "UNKNOWN(" + strconv.FormatUint(uint64(k), 10) + ")"
+}

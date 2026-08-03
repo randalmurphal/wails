@@ -68,6 +68,15 @@ type windowsWebviewWindow struct {
 	// the scale during a mixed-DPI monitor cross is exactly the transient
 	// the re-enable exists to avoid. Main-thread only.
 	monitorScaleDetectionOn bool
+	// renderUnresponsiveStrikes counts successive RENDER_PROCESS_UNRESPONSIVE
+	// notifications within one hang episode; WebView2 re-raises the event
+	// roughly every 30s while the renderer main thread stays stuck. The first
+	// strike re-navigates, which recovers a renderer that is still pumping
+	// IPC; from the second strike on, the navigation demonstrably could not
+	// commit, so processFailed rebuilds the controller instead. Reset in
+	// navigationCompleted — a completed navigation is proof of a responsive
+	// renderer. Main-thread only (both callbacks fire on the message loop).
+	renderUnresponsiveStrikes int
 
 	// Window visibility management - robust fallback for issue #2861
 	showRequested     bool        // Track if show() was called before navigation completed
@@ -2541,6 +2550,9 @@ func (w *windowsWebviewWindow) navigationCompleted(
 	sender *edge.ICoreWebView2,
 	args *edge.ICoreWebView2NavigationCompletedEventArgs,
 ) {
+	// A completed navigation proves the renderer is responsive — close out
+	// any renderer-unresponsive episode (see processFailed).
+	w.renderUnresponsiveStrikes = 0
 
 	// Install the runtime core
 	w.execJS(runtime.Core(globalApplication.impl.GetFlags(globalApplication.options)))
@@ -2949,40 +2961,103 @@ func (w *windowsWebviewWindow) applyDisplayAffinity(affinity uint32) bool {
 // handler, a dead browser process leaves the controller in a permanent
 // invalid state: every subsequent COM call fails with ERROR_INVALID_STATE
 // (0x8007139F), the window renders blank, and only an app restart recovers.
-// Renderer-level failures recover with a re-navigation; a browser-process
-// exit requires a full controller rebuild, deferred out of the callback per
-// WebView2 guidance. GPU and utility process failures are deliberately left
-// alone: Chromium restarts those processes itself, and if it gives up it
-// exits the browser process, which arrives here as BROWSER_PROCESS_EXITED.
+// A renderer exit recovers with a re-navigation; a browser-process exit
+// requires a full controller rebuild, deferred out of the callback per
+// WebView2 guidance. An unresponsive renderer gets one re-navigation
+// attempt, then escalates to a rebuild — see the case comment. GPU and
+// utility process failures are deliberately left alone: Chromium restarts
+// those processes itself, and if it gives up it exits the browser process,
+// which arrives here as BROWSER_PROCESS_EXITED.
 func (w *windowsWebviewWindow) processFailed(_ *edge.ICoreWebView2, args *edge.ICoreWebView2ProcessFailedEventArgs) {
 	kind, err := args.GetProcessFailedKind()
 	if err != nil {
 		globalApplication.error("webview2: process failed and failure kind unavailable: %v", err)
 		return
 	}
-	globalApplication.error("webview2: process failed: kind=%d", kind)
+	globalApplication.error("webview2: process failed: kind=%s%s", kind, processFailureDetails(args))
 	switch kind {
 	case edge.COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED:
-		InvokeAsync(w.rebuildWebView)
-	case edge.COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
-		edge.COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE:
+		InvokeAsync(func() {
+			w.rebuildWebView("browser process exited")
+		})
+	case edge.COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED:
 		if url := w.lastNavigatedURL; url != "" {
 			InvokeAsync(func() {
 				w.chromium.Navigate(url)
 			})
 		}
+	case edge.COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE:
+		w.renderUnresponsiveStrikes++
+		if w.renderUnresponsiveStrikes == 1 {
+			// A renderer whose main thread still pumps IPC recovers via
+			// re-navigation, same as a renderer exit.
+			if url := w.lastNavigatedURL; url != "" {
+				InvokeAsync(func() {
+					w.chromium.Navigate(url)
+				})
+			}
+			return
+		}
+		// The event re-fired ~30s after the re-navigation, so the navigation
+		// never committed: the renderer main thread is blocked outright and
+		// only replacing the process tree recovers (incident 2026-08-03 —
+		// seven notifications over three minutes, renderer near idle CPU,
+		// frozen until manually killed). Rebuild on every strike past the
+		// first: the ~30s event cadence rate-limits retries, and
+		// navigationCompleted resets the counter once a rebuild sticks.
+		InvokeAsync(func() {
+			w.rebuildWebView("renderer unresponsive after re-navigation")
+		})
 	}
 }
 
-// rebuildWebView replaces a dead WebView2 controller with a fresh one and
+// processFailureDetails renders the extended diagnostics from
+// ICoreWebView2ProcessFailedEventArgs2 (reason, exit code, process
+// description) for the process-failed log line. Returns "" when the
+// installed WebView2 runtime predates the interface.
+func processFailureDetails(args *edge.ICoreWebView2ProcessFailedEventArgs) string {
+	args2 := args.GetICoreWebView2ProcessFailedEventArgs2()
+	if args2 == nil {
+		return ""
+	}
+	defer args2.Release()
+	var b strings.Builder
+	if reason, err := args2.GetReason(); err == nil {
+		fmt.Fprintf(&b, " reason=%s", reason)
+	}
+	if exitCode, err := args2.GetExitCode(); err == nil {
+		fmt.Fprintf(&b, " exitCode=%d", exitCode)
+	}
+	if desc, err := args2.GetProcessDescription(); err == nil && desc != "" {
+		fmt.Fprintf(&b, " process=%q", desc)
+	}
+	return b.String()
+}
+
+// rebuildWebView replaces a broken WebView2 controller with a fresh one and
 // restores the last navigated URL. The old Chromium instance is abandoned
-// rather than re-embedded: after a browser-process exit every COM reference
-// it holds is dangling, and edge.Chromium.Embed's init-wait loop keys on a
+// rather than re-embedded: edge.Chromium.Embed's init-wait loop keys on a
 // per-instance flag that a used instance has already set, so re-embedding
-// the same instance would return before the new controller exists. The
-// construction mirrors run().
-func (w *windowsWebviewWindow) rebuildWebView() {
-	globalApplication.info("webview2: rebuilding controller after browser process exit")
+// the same instance would return before the new controller exists. The old
+// controller gets a best-effort Close first: after a browser-process exit
+// the reference is dangling and the call just fails with an HRESULT, but on
+// the renderer-unresponsive escalation path the browser process is still
+// alive, and without the Close the abandoned process tree — hung renderer
+// included — would leak alongside the new one. The construction mirrors
+// run().
+func (w *windowsWebviewWindow) rebuildWebView(reason string) {
+	globalApplication.info("webview2: rebuilding controller: %s", reason)
+	// IsReady, not just GetController() != nil: COM calls into a controller
+	// whose CreateCoreWebView2ControllerCompleted setup has not finished are
+	// unsafe (see edge.Chromium.Focus). A rebuild triggered that early skips
+	// the Close — there is no live process tree worth reaping yet.
+	if w.chromium.IsReady() {
+		if controller := w.chromium.GetController(); controller != nil {
+			if err := controller.Close(); err != nil {
+				globalApplication.info("webview2: closing abandoned controller: %v", err)
+			}
+		}
+	}
 	w.chromium = edge.NewChromium()
 	if globalApplication.options.ErrorHandler != nil {
 		w.chromium.SetErrorCallback(globalApplication.options.ErrorHandler)

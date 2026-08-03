@@ -89,6 +89,20 @@ func (i *ICoreWebView2Controller) PutBounds(bounds w32.Rect) error {
 	return nil
 }
 
+// Close shuts down the controller and releases the browser resources it
+// owns, including its render-process tree. Safe to call after the browser
+// process has already died — the call then fails with an HRESULT (typically
+// ERROR_INVALID_STATE) instead of crashing.
+func (i *ICoreWebView2Controller) Close() error {
+	hr, _, _ := i.vtbl.Close.Call(
+		uintptr(unsafe.Pointer(i)),
+	)
+	if windows.Handle(hr) != windows.S_OK {
+		return windows.Errno(hr)
+	}
+	return nil
+}
+
 func (i *ICoreWebView2Controller) MoveFocus(reason COREWEBVIEW2_MOVE_FOCUS_REASON) error {
 
 	hr, _, _ := i.vtbl.MoveFocus.Call(
