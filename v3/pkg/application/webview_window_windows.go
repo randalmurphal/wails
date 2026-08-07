@@ -22,9 +22,9 @@ import (
 	"github.com/wailsapp/wails/v3/internal/sliceutil"
 	"github.com/wailsapp/wails/v3/internal/webview2/webviewloader"
 
+	"github.com/wailsapp/wails/v3/internal/webview2/pkg/edge"
 	"github.com/wailsapp/wails/v3/pkg/events"
 	"github.com/wailsapp/wails/v3/pkg/w32"
-	"github.com/wailsapp/wails/v3/internal/webview2/pkg/edge"
 )
 
 var edgeMap = map[string]uintptr{
@@ -53,7 +53,14 @@ type windowsWebviewWindow struct {
 	previousWindowPlacement w32.WINDOWPLACEMENT
 
 	// Webview
-	chromium                   *edge.Chromium
+	chromium *edge.Chromium
+	// webviewNavigationCompleted gates the one-shot first-load work in
+	// navigationCompleted (the show/hide visibility hack, the pending
+	// visibility timeout). It is NOT a first-navigation latch: setURL clears
+	// it on every navigation, so it reads false for the duration of every
+	// runtime SetURL as well as during the first load. The liveness watchdog
+	// needs the latch semantics this flag only looks like it has, and keeps
+	// its own — see renderRecoveryState.firstNavigationDone.
 	webviewNavigationCompleted bool
 	// monitorScaleDetectionOn records that ShouldDetectMonitorScaleChanges
 	// was successfully re-enabled on the controller, making WebView2 the
@@ -1677,7 +1684,11 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 
 		}()
 
-		// Now do the actual close
+		// Now do the actual close. WM_DESTROY stops the watchdog too and is the
+		// chokepoint every teardown passes through, but DestroyWindow can pump
+		// messages before WM_DESTROY arrives, so stop it here first — ahead of
+		// ShuttingDown, so no tick can dispatch a ping into a controller that
+		// is about to start refusing calls.
 		w.stopRenderWatchdog()
 		w.chromium.ShuttingDown()
 		return w32.DefWindowProc(w.hwnd, w32.WM_CLOSE, 0, 0)
@@ -2466,8 +2477,16 @@ func (w *windowsWebviewWindow) setupChromium() {
 		} else if !isSuccessful {
 			globalApplication.debug("webview suspend declined by browser", "window", w.parent.id)
 		}
+		if errorCode != 0 || !isSuccessful {
+			// suspendWebview stood the liveness watchdog down optimistically at
+			// dispatch. The page was never suspended, so it still runs script
+			// and must still be watched: leaving the stand-down in place would
+			// blind the watchdog for the whole minimised period, and a renderer
+			// that wedges while minimised is exactly the case a minimise gate
+			// was deliberately rejected for (see standDownReasonAt).
+			w.setWebviewSuspended(false)
+		}
 	}
-	chromium.ExecuteScriptCompletedCallback = w.renderPongReceived
 
 	chromium.Embed(w.hwnd)
 
@@ -3200,11 +3219,10 @@ func processFailureDetails(args *edge.ICoreWebView2ProcessFailedEventArgs) strin
 // run().
 func (w *windowsWebviewWindow) rebuildWebView(reason string) {
 	globalApplication.info("webview2: rebuilding controller", "window", w.parent.id, "reason", reason)
-	// The rebuild is the terminal action of a recovery episode: close it out
-	// so a still-pending navigate deadline cannot fire into the controller
-	// this call is about to replace.
-	w.endRenderRecovery("controller rebuilt")
-	w.renderControllerReplaced()
+	// The rebuild is the terminal action of a recovery episode: this closes it
+	// out so a still-pending navigate deadline cannot fire into the controller
+	// the call is about to replace, and resets the watchdog for the cold start.
+	w.renderControllerReplaced("controller rebuilt")
 	// Captured before setupChromium, which navigates to options.URL and
 	// overwrites this. The two differ only when the app navigated at runtime
 	// without going through WebviewWindow.SetURL; when they agree, the

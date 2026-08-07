@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -73,7 +74,14 @@ type Chromium struct {
 	navigationCompleted              *ICoreWebView2NavigationCompletedEventHandler
 	processFailed                    *ICoreWebView2ProcessFailedEventHandler
 	trySuspendCompleted              *iCoreWebView2TrySuspendCompletedHandler
-	executeScriptCompleted           *iCoreWebView2ExecuteScriptCompletedHandler
+
+	// pendingScriptCompletions keeps every in-flight EvalWithCompletion
+	// handler reachable from Go. The handler pointer is handed to native code
+	// as a uintptr, which the GC does not see, so the map is what stops the
+	// object being collected before WebView2 invokes it. Entries are removed
+	// when the completion fires, or immediately if the dispatch failed.
+	pendingScriptCompletions   map[*iCoreWebView2ExecuteScriptCompletedHandler]struct{}
+	pendingScriptCompletionsMu sync.Mutex
 
 	environment            *ICoreWebView2Environment
 	webview2RuntimeVersion string
@@ -99,7 +107,6 @@ type Chromium struct {
 	NavigationCompletedCallback              func(sender *ICoreWebView2, args *ICoreWebView2NavigationCompletedEventArgs)
 	ProcessFailedCallback                    func(sender *ICoreWebView2, args *ICoreWebView2ProcessFailedEventArgs)
 	TrySuspendCompletedCallback              func(errorCode uintptr, isSuccessful bool)
-	ExecuteScriptCompletedCallback           func(errorCode uintptr, result string)
 	ContainsFullScreenElementChangedCallback func(sender *ICoreWebView2, args *ICoreWebView2ContainsFullScreenElementChangedEventArgs)
 	AcceleratorKeyCallback                   func(uint) bool
 	CursorChangedCallback                    func(cursor HCURSOR, systemCursorID uint32)
@@ -139,8 +146,8 @@ func NewChromium() *Chromium {
 	e.navigationCompleted = newICoreWebView2NavigationCompletedEventHandler(e)
 	e.processFailed = newICoreWebView2ProcessFailedEventHandler(e)
 	e.trySuspendCompleted = newICoreWebView2TrySuspendCompletedHandler(e)
-	e.executeScriptCompleted = newICoreWebView2ExecuteScriptCompletedHandler(e)
 	e.containsFullScreenElementChanged = newICoreWebView2ContainsFullScreenElementChangedEventHandler(e)
+	e.pendingScriptCompletions = make(map[*iCoreWebView2ExecuteScriptCompletedHandler]struct{})
 	/*
 		// Pinner seems to panic in some cases as reported on Discord, maybe during shutdown when GC detects pinned objects
 		// to be released that have not been unpinned.
@@ -786,36 +793,99 @@ func (e *Chromium) Bounds() *Rect {
 	return rect
 }
 
-// ExecuteScriptCompleted is the ICoreWebView2ExecuteScriptCompletedHandler
-// entry point. It is invoked on the thread that created the WebView2
-// environment (the host's message loop) once the renderer has evaluated a
-// script dispatched by EvalWithCompletion. executedScript holds the
-// JSON-encoded result; the pointer is owned by the caller, so the string is
-// copied out before returning.
-func (e *Chromium) ExecuteScriptCompleted(errorCode uintptr, executedScript *uint16) uintptr {
-	if e.ExecuteScriptCompletedCallback != nil {
-		e.ExecuteScriptCompletedCallback(errorCode, windows.UTF16PtrToString(executedScript))
-	}
+// scriptCompletionHandler is a one-shot ICoreWebView2ExecuteScriptCompletedHandler
+// bound to a single EvalWithCompletion call.
+//
+// One instance per call, rather than one shared handler multiplexing every
+// consumer through a single callback: the result string is page-controlled
+// data, and with a shared callback any second consumer's script result would
+// be delivered to the first consumer's handler — which for the renderer
+// liveness watchdog means a page able to produce an in-range integer could
+// forge a pong and disable hang detection.
+type scriptCompletionHandler struct {
+	chromium *Chromium
+	// handler is the COM object wrapping this impl — the pointer native code
+	// actually holds, and therefore the one Chromium.pendingScriptCompletions
+	// has to keep reachable. The two reference each other; retaining either
+	// keeps both alive.
+	handler     *iCoreWebView2ExecuteScriptCompletedHandler
+	onCompleted func(errorCode uintptr, result string)
+}
+
+func (h *scriptCompletionHandler) QueryInterface(_, _ uintptr) uintptr { return 0 }
+
+// AddRef and Release are no-ops returning 1, as everywhere else in this
+// package: lifetime is owned Go-side by Chromium.pendingScriptCompletions,
+// not by the COM refcount.
+func (h *scriptCompletionHandler) AddRef() uintptr  { return 1 }
+func (h *scriptCompletionHandler) Release() uintptr { return 1 }
+
+// ExecuteScriptCompleted is invoked on the thread that created the WebView2
+// environment (the host's message loop) once the request this handler was
+// created for has completed. executedScript holds the JSON-encoded result;
+// the pointer is owned by the caller, so the string is copied out before
+// returning.
+func (h *scriptCompletionHandler) ExecuteScriptCompleted(errorCode uintptr, executedScript *uint16) uintptr {
+	h.chromium.releaseScriptCompletion(h.handler)
+	h.onCompleted(errorCode, windows.UTF16PtrToString(executedScript))
 	return 0
 }
 
-// EvalWithCompletion runs script in the renderer and reports the outcome
-// through ExecuteScriptCompletedCallback. Eval is fire-and-forget; this is
-// the only way a host can observe that the renderer main thread actually ran
-// something, because the completion is raised from the renderer's reply.
-// Its absence is therefore evidence that the main thread is not running
-// script — see the renderer liveness watchdog in pkg/application.
+func (e *Chromium) retainScriptCompletion(h *iCoreWebView2ExecuteScriptCompletedHandler) {
+	e.pendingScriptCompletionsMu.Lock()
+	defer e.pendingScriptCompletionsMu.Unlock()
+	e.pendingScriptCompletions[h] = struct{}{}
+}
+
+func (e *Chromium) releaseScriptCompletion(h *iCoreWebView2ExecuteScriptCompletedHandler) {
+	e.pendingScriptCompletionsMu.Lock()
+	defer e.pendingScriptCompletionsMu.Unlock()
+	delete(e.pendingScriptCompletions, h)
+}
+
+// EvalWithCompletion runs script in the renderer and reports the outcome to
+// onCompleted. Eval is fire-and-forget; this is the only way a host can
+// observe that the renderer main thread actually ran something, because the
+// completion is raised from the renderer's reply. Its absence is therefore
+// evidence that the main thread is not running script — see the renderer
+// liveness watchdog in pkg/application.
 //
-// A nil error means the request was dispatched, not that it ran. A non-nil
-// error means no completion will ever arrive for this call.
-func (e *Chromium) EvalWithCompletion(script string) error {
+// onCompleted is invoked at most once, on the host's message loop, and is
+// required. A nil error means the request was dispatched, not that it ran; a
+// non-nil error means the request never reached the browser and onCompleted
+// will never be called.
+//
+// WebView2 answers a still-pending request with S_OK and a JSON "null" when
+// its target document goes away, so onCompleted firing is not by itself proof
+// the renderer evaluated anything — check the result. The one case where no
+// completion ever arrives despite a successful dispatch is the controller
+// being torn down outright, which abandons the whole Chromium instance and
+// the pending handlers with it.
+func (e *Chromium) EvalWithCompletion(script string, onCompleted func(errorCode uintptr, result string)) error {
+	if onCompleted == nil {
+		return errors.New("EvalWithCompletion requires a completion callback")
+	}
 	if !e.IsReady() || e.webview == nil {
 		return errors.New("webview not ready")
 	}
 	if e.shuttingDown {
 		return errors.New("webview shutting down")
 	}
-	return e.webview.ExecuteScript(script, e.executeScriptCompleted)
+	impl := &scriptCompletionHandler{chromium: e, onCompleted: onCompleted}
+	impl.handler = newICoreWebView2ExecuteScriptCompletedHandler(impl)
+	e.retainScriptCompletion(impl.handler)
+	err := e.webview.ExecuteScript(script, impl.handler)
+	if err != nil && !errors.Is(err, windows.ERROR_IO_PENDING) {
+		// Only a hard failure means no completion will arrive.
+		// ERROR_IO_PENDING is the browser saying the request is in flight —
+		// the same tolerance Eval applies, and the reason it matters here is
+		// that reporting it as a dispatch failure would make a busy browser
+		// look like a ping that was never sent, which is precisely the state
+		// the liveness watchdog must not mistake for "nothing to wait for".
+		e.releaseScriptCompletion(impl.handler)
+		return err
+	}
+	return nil
 }
 
 func (e *Chromium) TrySuspendCompleted(errorCode uintptr, isSuccessful bool) uintptr {
