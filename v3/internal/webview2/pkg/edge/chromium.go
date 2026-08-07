@@ -73,6 +73,7 @@ type Chromium struct {
 	navigationCompleted              *ICoreWebView2NavigationCompletedEventHandler
 	processFailed                    *ICoreWebView2ProcessFailedEventHandler
 	trySuspendCompleted              *iCoreWebView2TrySuspendCompletedHandler
+	executeScriptCompleted           *iCoreWebView2ExecuteScriptCompletedHandler
 
 	environment            *ICoreWebView2Environment
 	webview2RuntimeVersion string
@@ -98,6 +99,7 @@ type Chromium struct {
 	NavigationCompletedCallback              func(sender *ICoreWebView2, args *ICoreWebView2NavigationCompletedEventArgs)
 	ProcessFailedCallback                    func(sender *ICoreWebView2, args *ICoreWebView2ProcessFailedEventArgs)
 	TrySuspendCompletedCallback              func(errorCode uintptr, isSuccessful bool)
+	ExecuteScriptCompletedCallback           func(errorCode uintptr, result string)
 	ContainsFullScreenElementChangedCallback func(sender *ICoreWebView2, args *ICoreWebView2ContainsFullScreenElementChangedEventArgs)
 	AcceleratorKeyCallback                   func(uint) bool
 	CursorChangedCallback                    func(cursor HCURSOR, systemCursorID uint32)
@@ -137,6 +139,7 @@ func NewChromium() *Chromium {
 	e.navigationCompleted = newICoreWebView2NavigationCompletedEventHandler(e)
 	e.processFailed = newICoreWebView2ProcessFailedEventHandler(e)
 	e.trySuspendCompleted = newICoreWebView2TrySuspendCompletedHandler(e)
+	e.executeScriptCompleted = newICoreWebView2ExecuteScriptCompletedHandler(e)
 	e.containsFullScreenElementChanged = newICoreWebView2ContainsFullScreenElementChangedEventHandler(e)
 	/*
 		// Pinner seems to panic in some cases as reported on Discord, maybe during shutdown when GC detects pinned objects
@@ -781,6 +784,38 @@ func (e *Chromium) Bounds() *Rect {
 		return nil
 	}
 	return rect
+}
+
+// ExecuteScriptCompleted is the ICoreWebView2ExecuteScriptCompletedHandler
+// entry point. It is invoked on the thread that created the WebView2
+// environment (the host's message loop) once the renderer has evaluated a
+// script dispatched by EvalWithCompletion. executedScript holds the
+// JSON-encoded result; the pointer is owned by the caller, so the string is
+// copied out before returning.
+func (e *Chromium) ExecuteScriptCompleted(errorCode uintptr, executedScript *uint16) uintptr {
+	if e.ExecuteScriptCompletedCallback != nil {
+		e.ExecuteScriptCompletedCallback(errorCode, windows.UTF16PtrToString(executedScript))
+	}
+	return 0
+}
+
+// EvalWithCompletion runs script in the renderer and reports the outcome
+// through ExecuteScriptCompletedCallback. Eval is fire-and-forget; this is
+// the only way a host can observe that the renderer main thread actually ran
+// something, because the completion is raised from the renderer's reply.
+// Its absence is therefore evidence that the main thread is not running
+// script — see the renderer liveness watchdog in pkg/application.
+//
+// A nil error means the request was dispatched, not that it ran. A non-nil
+// error means no completion will ever arrive for this call.
+func (e *Chromium) EvalWithCompletion(script string) error {
+	if !e.IsReady() || e.webview == nil {
+		return errors.New("webview not ready")
+	}
+	if e.shuttingDown {
+		return errors.New("webview shutting down")
+	}
+	return e.webview.ExecuteScript(script, e.executeScriptCompleted)
 }
 
 func (e *Chromium) TrySuspendCompleted(errorCode uintptr, isSuccessful bool) uintptr {

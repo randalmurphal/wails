@@ -68,15 +68,14 @@ type windowsWebviewWindow struct {
 	// so the last host-requested navigation is the only reliable record.
 	// Main-thread only, like the rest of the webview state.
 	lastNavigatedURL string
-	// renderUnresponsiveStrikes counts successive RENDER_PROCESS_UNRESPONSIVE
-	// notifications within one hang episode; WebView2 re-raises the event
-	// roughly every 30s while the renderer main thread stays stuck. The first
-	// strike re-navigates, which recovers a renderer that is still pumping
-	// IPC; from the second strike on, the navigation demonstrably could not
-	// commit, so processFailed rebuilds the controller instead. Reset in
-	// navigationCompleted — a completed navigation is proof of a responsive
-	// renderer. Main-thread only (both callbacks fire on the message loop).
-	renderUnresponsiveStrikes int
+	// renderRecovery is the renderer liveness watchdog and the recovery
+	// episode it (or a RENDER_PROCESS_UNRESPONSIVE notification) opens. The
+	// notification cannot be counted on to repeat — Chromium's hang monitor
+	// is input-driven and stops entirely while the widget is hidden — so
+	// recovery runs on a host-owned deadline instead, and detection cannot
+	// rely on the notification arriving at all. See
+	// webview_window_windows_renderwatch.go. Main-thread only.
+	renderRecovery renderRecoveryState
 
 	// Window visibility management - robust fallback for issue #2861
 	showRequested     bool        // Track if show() was called before navigation completed
@@ -522,6 +521,11 @@ func (w *windowsWebviewWindow) run() {
 	}
 
 	w.setupChromium()
+
+	// The watchdog outlives controller rebuilds — it always pings whichever
+	// controller w.chromium currently holds — so it is started here rather
+	// than in setupChromium, which rebuildWebView also calls.
+	w.startRenderWatchdog()
 
 	if options.Windows.WindowDidMoveDebounceMS == 0 {
 		options.Windows.WindowDidMoveDebounceMS = 50
@@ -1674,8 +1678,15 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 		}()
 
 		// Now do the actual close
+		w.stopRenderWatchdog()
 		w.chromium.ShuttingDown()
 		return w32.DefWindowProc(w.hwnd, w32.WM_CLOSE, 0, 0)
+	case w32.WM_DESTROY:
+		// The chokepoint every teardown passes through — Close(), Destroy()
+		// and a system-initiated destroy alike. Stopping here guarantees no
+		// ping tick and no recovery deadline can fire into a window whose
+		// HWND and controller are gone. Idempotent.
+		w.stopRenderWatchdog()
 	case w32.WM_SETCURSOR:
 		if w.compositionCursor != 0 && w32.LOWORD(uint32(lparam)) == w32.HTCLIENT {
 			w32.SetCursor(w.compositionCursor)
@@ -2456,6 +2467,7 @@ func (w *windowsWebviewWindow) setupChromium() {
 			globalApplication.debug("webview suspend declined by browser", "window", w.parent.id)
 		}
 	}
+	chromium.ExecuteScriptCompletedCallback = w.renderPongReceived
 
 	chromium.Embed(w.hwnd)
 
@@ -2648,8 +2660,12 @@ func (w *windowsWebviewWindow) setupChromium() {
 		if err != nil {
 			globalApplication.handleFatalError(err)
 		}
-		w.webviewNavigationCompleted = false
-		chromium.Navigate(startURL)
+		// Through setURL, not chromium.Navigate: the start URL has to be
+		// recorded in lastNavigatedURL like every other navigation. It is the
+		// only thing process-failure recovery can restore, and for an app that
+		// never calls SetURL at runtime — the common case — this is the only
+		// navigation there is.
+		w.setURL(startURL)
 	}
 
 }
@@ -2682,8 +2698,9 @@ func (w *windowsWebviewWindow) navigationCompleted(
 	args *edge.ICoreWebView2NavigationCompletedEventArgs,
 ) {
 	// A completed navigation proves the renderer is responsive — close out
-	// any renderer-unresponsive episode (see processFailed).
-	w.renderUnresponsiveStrikes = 0
+	// any recovery episode and restart the liveness deadline (see
+	// beginRenderRecovery).
+	w.renderNavigationCommitted()
 
 	// Inject runtime core and window-specific flags together so side-effect
 	// runtime modules see a consistent _wails configuration at startup.
@@ -3042,7 +3059,12 @@ func (w *windowsWebviewWindow) suspendWebview() {
 		globalApplication.error("suspendWebview: TrySuspend: %s", err)
 		// The webview stays hidden — resumeWebview's Show reverses it on
 		// restore regardless of suspend state.
+		return
 	}
+	// Stand the liveness watchdog down: a suspended webview runs no script
+	// by design, and waking it every ping interval would undo the memory
+	// trim this call exists for.
+	w.setWebviewSuspended(true)
 }
 
 // resumeWebview resumes a suspended WebView2 and re-shows its surface.
@@ -3055,6 +3077,14 @@ func (w *windowsWebviewWindow) resumeWebview() {
 	if err := w.chromium.Show(); err != nil {
 		globalApplication.error("resumeWebview: show webview: %s", err)
 	}
+	// Clear the watchdog stand-down unconditionally, including when Resume
+	// reported an error: WebView2 also resumes itself on user input, so a
+	// failed explicit Resume is not proof the webview is still suspended,
+	// and leaving the flag set would disable the watchdog for the rest of
+	// the window's life. The watchdog re-arms with a full fresh deadline on
+	// its next tick, so a webview that really is still suspended costs at
+	// most one detection cycle, not a false rebuild.
+	w.setWebviewSuspended(false)
 }
 
 func (w *windowsWebviewWindow) setContentProtection(enabled bool) {
@@ -3102,11 +3132,13 @@ func (w *windowsWebviewWindow) applyDisplayAffinity(affinity uint32) bool {
 // (0x8007139F), the window renders blank, and only an app restart recovers.
 // A renderer exit recovers with a re-navigation; a browser-process exit
 // requires a full controller rebuild, deferred out of the callback per
-// WebView2 guidance. An unresponsive renderer gets one re-navigation
-// attempt, then escalates to a rebuild — see the case comment. GPU and
-// utility process failures are deliberately left alone: Chromium restarts
-// those processes itself, and if it gives up it exits the browser process,
-// which arrives here as BROWSER_PROCESS_EXITED.
+// WebView2 guidance. An unresponsive renderer opens a recovery episode,
+// which re-navigates and escalates to a rebuild on its own deadline — the
+// notification is a one-shot trigger and must never be relied on to repeat
+// (see webview_window_windows_renderwatch.go). GPU and utility process
+// failures are deliberately left alone: Chromium restarts those processes
+// itself, and if it gives up it exits the browser process, which arrives
+// here as BROWSER_PROCESS_EXITED.
 func (w *windowsWebviewWindow) processFailed(_ *edge.ICoreWebView2, args *edge.ICoreWebView2ProcessFailedEventArgs) {
 	kind, err := args.GetProcessFailedKind()
 	if err != nil {
@@ -3126,26 +3158,8 @@ func (w *windowsWebviewWindow) processFailed(_ *edge.ICoreWebView2, args *edge.I
 			})
 		}
 	case edge.COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE:
-		w.renderUnresponsiveStrikes++
-		if w.renderUnresponsiveStrikes == 1 {
-			// A renderer whose main thread still pumps IPC recovers via
-			// re-navigation, same as a renderer exit.
-			if url := w.lastNavigatedURL; url != "" {
-				InvokeAsync(func() {
-					w.chromium.Navigate(url)
-				})
-			}
-			return
-		}
-		// The event re-fired ~30s after the re-navigation, so the navigation
-		// never committed: the renderer main thread is blocked outright and
-		// only replacing the process tree recovers (incident 2026-08-03 —
-		// seven notifications over three minutes, renderer near idle CPU,
-		// frozen until manually killed). Rebuild on every strike past the
-		// first: the ~30s event cadence rate-limits retries, and
-		// navigationCompleted resets the counter once a rebuild sticks.
 		InvokeAsync(func() {
-			w.rebuildWebView("renderer unresponsive after re-navigation")
+			w.beginRenderRecovery("WebView2 reported the render process unresponsive")
 		})
 	}
 }
@@ -3185,7 +3199,17 @@ func processFailureDetails(args *edge.ICoreWebView2ProcessFailedEventArgs) strin
 // included — would leak alongside the new one. The construction mirrors
 // run().
 func (w *windowsWebviewWindow) rebuildWebView(reason string) {
-	globalApplication.info("webview2: rebuilding controller: %s", reason)
+	globalApplication.info("webview2: rebuilding controller", "window", w.parent.id, "reason", reason)
+	// The rebuild is the terminal action of a recovery episode: close it out
+	// so a still-pending navigate deadline cannot fire into the controller
+	// this call is about to replace.
+	w.endRenderRecovery("controller rebuilt")
+	w.renderControllerReplaced()
+	// Captured before setupChromium, which navigates to options.URL and
+	// overwrites this. The two differ only when the app navigated at runtime
+	// without going through WebviewWindow.SetURL; when they agree, the
+	// setupChromium navigation is the restore and nothing more is needed.
+	restoreURL := w.lastNavigatedURL
 	// IsReady, not just GetController() != nil: COM calls into a controller
 	// whose CreateCoreWebView2ControllerCompleted setup has not finished are
 	// unsafe (see edge.Chromium.Focus). A rebuild triggered that early skips
@@ -3202,7 +3226,7 @@ func (w *windowsWebviewWindow) rebuildWebView(reason string) {
 		w.chromium.SetErrorCallback(globalApplication.options.ErrorHandler)
 	}
 	w.setupChromium()
-	if url := w.lastNavigatedURL; url != "" {
-		w.setURL(url)
+	if restoreURL != "" && restoreURL != w.lastNavigatedURL {
+		w.setURL(restoreURL)
 	}
 }
