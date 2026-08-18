@@ -84,6 +84,12 @@ type windowsWebviewWindow struct {
 	// webview_window_windows_renderwatch.go. Main-thread only.
 	renderRecovery renderRecoveryState
 
+	// renderForensics tracks which recovery episode a minidump capture has
+	// already been taken for, so a repeat hang signal inside one episode
+	// cannot start a second set of dumps against the same processes. See
+	// renderforensics.go. Main-thread only.
+	renderForensics renderForensicsState
+
 	// Window visibility management - robust fallback for issue #2861
 	showRequested     bool        // Track if show() was called before navigation completed
 	visibilityTimeout *time.Timer // Timeout to show window if navigation is delayed

@@ -350,6 +350,21 @@ func (i *ICoreWebView2) GetSource() (string, error) {
 	return source, nil
 }
 
+// GetBrowserProcessID returns the OS process id of the browser process
+// backing this WebView2. It is the parent of the renderer, GPU and utility
+// processes, and the one whose tree a controller Close reaps.
+func (i *ICoreWebView2) GetBrowserProcessID() (uint32, error) {
+	var value uint32
+	hr, _, _ := i.vtbl.GetBrowserProcessID.Call(
+		uintptr(unsafe.Pointer(i)),
+		uintptr(unsafe.Pointer(&value)),
+	)
+	if windows.Handle(hr) != windows.S_OK {
+		return 0, windows.Errno(hr)
+	}
+	return value, nil
+}
+
 func (i *ICoreWebView2) GetContainsFullScreenElement() (bool, error) {
 	// BOOL out-params are 4 bytes; receiving into a 1-byte Go bool lets the
 	// callee write 3 bytes out of bounds on the stack.

@@ -301,6 +301,35 @@ type WindowsOptions struct {
 	// See: https://github.com/MicrosoftEdge/WebView2Feedback/issues/5248
 	// See: https://github.com/MicrosoftEdge/WebView2Feedback/issues/4485
 	UseVisualHosting bool
+
+	// RenderForensicsDir enables renderer-hang forensics and names the
+	// directory they are written to. Empty (the default) disables them
+	// entirely: nothing is enumerated, nothing is dumped, and no directory is
+	// created. Wails does not pick a location for you — the consuming app
+	// opts in, and chooses somewhere it is willing to keep tens of megabytes.
+	//
+	// When set, the render watchdog captures evidence at the moment it
+	// declares a renderer hung, BEFORE the recovery escalation rebuilds the
+	// controller and reaps the WebView2 process tree along with the wedged
+	// renderer. Two artifacts land in the directory:
+	//
+	//   - renderer-hang-<utc>-pid<pid>.dmp — a minidump of each renderer
+	//     process, carrying thread stacks and module lists (not full memory).
+	//     At most 3 are retained; the oldest are deleted as new ones land.
+	//   - render-hang-breadcrumbs.jsonl — an append-only flat-JSON log of the
+	//     hang, the dump attempts and the episode's outcome. Capped at 256KB,
+	//     oldest records dropped first.
+	//
+	// Capture runs on a background goroutine and can never delay or change
+	// the recovery; a dump that the recovery outruns is logged as a failure
+	// and the breadcrumb is kept regardless. Requires WebView2 Runtime
+	// 99.0.1150.38 or later for the process enumeration
+	// (ICoreWebView2Environment8); on an older runtime the breadcrumb records
+	// that enumeration was unavailable and no dump is taken.
+	//
+	// Windows only. The dumps contain renderer memory — page content
+	// included — so treat the directory as sensitive.
+	RenderForensicsDir string
 }
 
 /********* Linux Options *********/

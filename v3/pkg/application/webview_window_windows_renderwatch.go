@@ -315,6 +315,16 @@ func (w *windowsWebviewWindow) beginRenderRecovery(reason string) {
 	globalApplication.error("webview2: render recovery episode %d started for window %v: %s",
 		episode, w.parent.id, reason)
 
+	// Before anything below: every path out of here ends, sooner or later, in
+	// rebuildWebView closing the controller and reaping the WebView2 process
+	// tree — the wedged renderer with it. Right now that renderer is stuck but
+	// alive and dumpable, and there is at least renderRecoveryNavigateDeadline
+	// (usually much more) before it is gone. Three incidents of this class
+	// have been "recovered" with no forensic artifact at all; this is where
+	// that stops. The COM enumeration is synchronous and cheap; the dumps run
+	// on a goroutine and cannot delay the recovery.
+	w.captureRenderHang(episode, reason)
+
 	if w.chromium == nil || !w.chromium.IsReady() {
 		globalApplication.error(
 			"webview2: render recovery episode %d for window %v found no ready controller; rebuilding",
@@ -355,6 +365,10 @@ func (w *windowsWebviewWindow) endRenderRecovery(reason string) {
 	}
 	globalApplication.info("webview2: render recovery episode closed",
 		"window", w.parent.id, "episode", w.renderRecovery.episode, "reason", reason)
+	// The disposition half of the forensic record: reason is what actually
+	// happened to the episode (re-navigation committed, controller rebuilt,
+	// window torn down), which is the one thing a dump on its own cannot say.
+	w.recordRenderEpisodeClosed(w.renderRecovery.episode, reason)
 }
 
 // renderRecoveryDeadlineExpired escalates an episode whose re-navigation
