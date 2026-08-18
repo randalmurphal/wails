@@ -75,6 +75,13 @@ type Chromium struct {
 	processFailed                    *ICoreWebView2ProcessFailedEventHandler
 	trySuspendCompleted              *iCoreWebView2TrySuspendCompletedHandler
 
+	// initFailed latches when an error is reported before the instance ever
+	// finished coming up. Embed's wait loop only breaks on inited or WM_QUIT,
+	// so without it a failed environment or controller creation would leave
+	// that loop pumping messages forever. It could not happen while
+	// errorCallback ended the process; it can now.
+	initFailed uintptr
+
 	// pendingScriptCompletions keeps every in-flight EvalWithCompletion
 	// handler reachable from Go. The handler pointer is handed to native code
 	// as a uintptr, which the GC does not see, so the map is what stops the
@@ -111,8 +118,13 @@ type Chromium struct {
 	AcceleratorKeyCallback                   func(uint) bool
 	CursorChangedCallback                    func(cursor HCURSOR, systemCursorID uint32)
 
-	// Error handling
+	// Error handling. globalErrorCallback REPORTS an error; errorPolicy
+	// DECIDES what happens next. The split matters because whether a WebView2
+	// error is fatal depends on facts this package does not have — is the
+	// window booting, rebuilding a broken controller, or already tearing down
+	// — and only the host knows them. See errorCallback.
 	globalErrorCallback func(error)
+	errorPolicy         func(error)
 
 	shuttingDown bool
 
@@ -173,15 +185,52 @@ func (e *Chromium) ShuttingDown() {
 	e.shuttingDown = true
 }
 
+// IsShuttingDown reports whether the host has announced that this instance is
+// being torn down. Errors raised after that point are teardown noise — an
+// aborted controller creation, a COM call into a controller that is already
+// closing — and the host uses this to say so.
+func (e *Chromium) IsShuttingDown() bool {
+	return e.shuttingDown
+}
+
+// errorCallback reports an error this instance cannot recover from itself.
+//
+// It does NOT decide whether the process survives it. This used to end with
+// os.Exit(1), which turned every reported error into a silent process kill —
+// including the one a user causes by closing the window while a controller
+// rebuild is in flight, which arrives here as E_ABORT (0x80004004) from the
+// pending CreateCoreWebView2Controller. Classification needs to know whether
+// the window is booting, rebuilding or closing, which is host state; the host
+// installs that decision with SetErrorPolicy.
+//
+// With no policy installed this package only reports and returns. Callers must
+// therefore assume errorCallback RETURNS and keep their own control flow safe
+// (nothing below may dereference a controller or webview that failed to come
+// up).
 func (e *Chromium) errorCallback(err error) {
-	e.globalErrorCallback(err)
-	os.Exit(1)
+	if atomic.LoadUintptr(&e.inited) == 0 {
+		atomic.StoreUintptr(&e.initFailed, 1)
+	}
+	if e.globalErrorCallback != nil {
+		e.globalErrorCallback(err)
+	}
+	if e.errorPolicy != nil {
+		e.errorPolicy(err)
+	}
 }
 
 func (e *Chromium) SetErrorCallback(callback func(error)) {
 	if callback != nil {
 		e.globalErrorCallback = callback
 	}
+}
+
+// SetErrorPolicy installs the host's decision function for reported errors.
+// It runs on the thread the error was raised on — the COM/main thread — after
+// the error has been reported, and may block (a modal message box) or not
+// return at all (a visible fatal exit).
+func (e *Chromium) SetErrorPolicy(policy func(error)) {
+	e.errorPolicy = policy
 }
 
 func (e *Chromium) SetCursorChangedCallback(callback func(cursor HCURSOR, systemCursorID uint32)) {
@@ -202,6 +251,7 @@ func (e *Chromium) Embed(hwnd uintptr) bool {
 		_, err = windows.GetModuleFileName(windows.Handle(0), &currentExePath[0], windows.MAX_PATH)
 		if err != nil {
 			e.errorCallback(err)
+			return false
 		}
 		currentExeName := filepath.Base(windows.UTF16ToString(currentExePath))
 		dataPath = filepath.Join(os.Getenv("AppData"), currentExeName)
@@ -210,22 +260,32 @@ func (e *Chromium) Embed(hwnd uintptr) bool {
 	if e.BrowserPath != "" {
 		if _, err = os.Stat(e.BrowserPath); errors.Is(err, os.ErrNotExist) {
 			e.errorCallback(fmt.Errorf("browser path '%s' does not exist", e.BrowserPath))
+			return false
 		}
 	}
 
 	browserArgs := strings.Join(e.AdditionalBrowserArgs, " ")
 	if err := createCoreWebView2EnvironmentWithOptions(e.BrowserPath, dataPath, e.envCompleted, browserArgs); err != nil {
 		e.errorCallback(fmt.Errorf("error calling Webview2Loader: %s", err.Error()))
+		return false
 	}
 
 	e.webview2RuntimeVersion, err = webviewloader.GetAvailableCoreWebView2BrowserVersionString(e.BrowserPath)
 	if err != nil {
 		e.errorCallback(fmt.Errorf("error getting Webview2 runtime version: %s", err.Error()))
+		return false
 	}
 
 	var msg w32.Msg
 	for {
 		if atomic.LoadUintptr(&e.inited) != 0 {
+			break
+		}
+		if atomic.LoadUintptr(&e.initFailed) != 0 {
+			// Environment or controller creation failed on the message loop
+			// below; nothing will ever set inited. The error has already been
+			// reported to the host's error policy, which owns whether the
+			// process survives it.
 			break
 		}
 		r, _, _ := w32.User32GetMessageW.Call(
@@ -239,6 +299,12 @@ func (e *Chromium) Embed(hwnd uintptr) bool {
 		}
 		w32.User32TranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
 		w32.User32DispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
+	}
+	if atomic.LoadUintptr(&e.inited) == 0 {
+		// Creation failed, or the loop ended on WM_QUIT. Either way there is
+		// no webview, and everything the caller does next — starting with the
+		// Init below — would dereference it.
+		return false
 	}
 	e.Init("window.external={invoke:s=>window.chrome.webview.postMessage(s)}")
 	return true
@@ -328,11 +394,21 @@ func (e *Chromium) Eval(script string) {
 	}
 }
 
+// Show and Hide tolerate a missing controller. A window can now outlive a
+// failed controller build — the host retries it instead of exiting — and a
+// user clicking the taskbar during that window must not dereference nil.
+
 func (e *Chromium) Show() error {
+	if e.controller == nil {
+		return nil
+	}
 	return e.controller.PutIsVisible(true)
 }
 
 func (e *Chromium) Hide() error {
+	if e.controller == nil {
+		return nil
+	}
 	return e.controller.PutIsVisible(false)
 }
 
@@ -352,9 +428,10 @@ func (e *Chromium) EnvironmentCompleted(res uintptr, env *ICoreWebView2Environme
 	if env == nil {
 		err := syscall.Errno(res)
 		log.Printf("[WebView2] Environment creation failed with error code %v: %v\n", res, err)
-		if e.globalErrorCallback != nil {
-			e.globalErrorCallback(fmt.Errorf("failed to create WebView2 environment: %w", err))
-		}
+		// Through errorCallback rather than the report channel directly: this
+		// is a creation failure the host has to classify, and it is also what
+		// releases Embed's wait loop, which nothing else here would do.
+		e.errorCallback(fmt.Errorf("failed to create WebView2 environment: %w", err))
 		return res
 	}
 
@@ -381,6 +458,15 @@ func (e *Chromium) EnvironmentCompleted(res uintptr, env *ICoreWebView2Environme
 func (e *Chromium) CreateCoreWebView2ControllerCompleted(res uintptr, controller *ICoreWebView2Controller) uintptr {
 	if int32(res) < 0 {
 		e.errorCallback(fmt.Errorf("error creating controller with %08x: %s", res, syscall.Errno(res)))
+		// errorCallback returns whenever the host declines to treat the
+		// failure as fatal — the common case being E_ABORT (0x80004004),
+		// which is what a user closing the window mid-rebuild looks like.
+		// There is no controller to initialise on that path.
+		return res
+	}
+	if controller == nil {
+		e.errorCallback(fmt.Errorf("controller creation completed with %08x but produced no controller", res))
+		return uintptr(windows.E_FAIL)
 	}
 
 	return e.initializeController(controller)
@@ -512,6 +598,12 @@ func (e *Chromium) initializeController(controller *ICoreWebView2Controller) uin
 	e.webview, err = e.controller.GetCoreWebView2()
 	if err != nil {
 		e.errorCallback(err)
+	}
+	if e.webview == nil {
+		// Only reachable when the host's error policy declined to end the
+		// process (the window is tearing down). Every line below dereferences
+		// the webview.
+		return uintptr(windows.E_FAIL)
 	}
 
 	e.webview.AddRef()
@@ -949,8 +1041,8 @@ func (e *Chromium) Focus() {
 	// is still being configured in CreateCoreWebView2ControllerCompleted
 	// (issue #5446). Callers' GetController() != nil checks cannot exclude
 	// that window, so guard here: dropping a focus request during startup is
-	// harmless, calling MoveFocus on a partially-initialised controller is
-	// fatal (errorCallback exits the process).
+	// harmless, calling MoveFocus on a partially-initialised controller
+	// reports to errorCallback, which is fatal for a live window.
 	if !e.IsReady() {
 		return
 	}
@@ -959,8 +1051,8 @@ func (e *Chromium) Focus() {
 		// MoveFocus can legitimately fail after initialisation too — e.g.
 		// E_INVALIDARG when the window is hidden or minimised to the tray
 		// (wailsapp/wails#4158 reproduces this on tray-click restore). A
-		// failed focus request is never worth killing the process, which is
-		// what errorCallback does; log it instead.
+		// failed focus request is never worth reporting to errorCallback,
+		// which is fatal for a live window; log it instead.
 		log.Printf("[WebView2] Focus failed: %v", err)
 	}
 }

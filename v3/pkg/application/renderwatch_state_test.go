@@ -841,3 +841,131 @@ func TestRenderWatchStateControllerReplaceClearsSuspend(t *testing.T) {
 		t.Fatalf("watchdog stood down against a fresh controller: %q", reason)
 	}
 }
+
+// --- Rebuild lifecycle and the WebView2 error policy ------------------------
+
+// TestRebuildLifecycleFlagsTrackTheRebuild: the indicator flag spans the
+// rebuild and the retry budget survives it — the retry IS a second rebuild,
+// so a rebuildStarted that cleared the budget would make recovery a loop.
+func TestRebuildLifecycleFlagsTrackTheRebuild(t *testing.T) {
+	h := newRenderWatchHarness(t)
+
+	if !h.r.rebuildStarted() {
+		t.Fatal("rebuildStarted on a settled controller reported no change")
+	}
+	if h.r.rebuildStarted() {
+		t.Fatal("rebuildStarted during a rebuild reported a change")
+	}
+	if !h.r.useRebuildRetry() {
+		t.Fatal("the first retry was refused")
+	}
+	if h.r.useRebuildRetry() {
+		t.Fatal("a second retry was allowed in the same episode")
+	}
+	// The retry is itself a rebuild: entering one again must not refund it.
+	h.r.rebuildInFlight = false
+	h.r.rebuildStarted()
+	if !h.r.rebuildRetryUsed {
+		t.Fatal("re-entering a rebuild refunded the retry budget")
+	}
+
+	if !h.r.navigationCommitted(h.now) {
+		t.Fatal("the navigation that ended the rebuild reported nothing")
+	}
+	if h.r.rebuildInFlight {
+		t.Fatal("navigationCommitted left the rebuild in flight")
+	}
+	if h.r.rebuildRetryUsed {
+		t.Fatal("a rebuild that succeeded did not restore the retry budget")
+	}
+	if h.r.navigationCommitted(h.now) {
+		t.Fatal("an ordinary navigation reported the end of a rebuild")
+	}
+}
+
+// TestRebuildFlagsClearedOnStop: the window is being destroyed, so nothing may
+// keep painting an indicator or scheduling a retry against it.
+func TestRebuildFlagsClearedOnStop(t *testing.T) {
+	h := newRenderWatchHarness(t)
+	h.r.rebuildStarted()
+	h.r.useRebuildRetry()
+
+	h.r.stop()
+	if h.r.rebuildInFlight || h.r.rebuildRetryUsed {
+		t.Fatalf("stop left rebuild state behind: inFlight=%v retryUsed=%v",
+			h.r.rebuildInFlight, h.r.rebuildRetryUsed)
+	}
+}
+
+// TestClassifyWebviewError pins the policy that replaced edge's unconditional
+// os.Exit(1). The teardown case is the incident: E_ABORT on a controller
+// creation the user aborted by closing the window is a normal close.
+func TestClassifyWebviewError(t *testing.T) {
+	tests := []struct {
+		name string
+		in   webviewErrorInputs
+		want webviewErrorDisposition
+	}{
+		{
+			name: "closing the window mid-rebuild is not a crash",
+			in:   webviewErrorInputs{shuttingDown: true, rebuildInFlight: true},
+			want: webviewErrorIgnore,
+		},
+		{
+			name: "teardown outranks a boot failure",
+			in:   webviewErrorInputs{shuttingDown: true},
+			want: webviewErrorIgnore,
+		},
+		{
+			name: "no controller has ever come up",
+			in:   webviewErrorInputs{},
+			want: webviewErrorFatalStartup,
+		},
+		{
+			name: "a failed rebuild is worth one retry",
+			in:   webviewErrorInputs{rebuildInFlight: true},
+			want: webviewErrorRetryRebuild,
+		},
+		{
+			name: "a rebuild that failed twice is unrecoverable",
+			in:   webviewErrorInputs{rebuildInFlight: true, rebuildRetryUsed: true},
+			want: webviewErrorFatalRuntime,
+		},
+		{
+			name: "a fatal error on a live controller is not a boot failure",
+			in:   webviewErrorInputs{controllerReady: true},
+			want: webviewErrorFatalRuntime,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyWebviewError(tt.in); got != tt.want {
+				t.Fatalf("classifyWebviewError(%+v) = %d, want %d", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRebuildRetryCannotLoop walks the whole escalation the way the host does:
+// two failed rebuilds end at a visible fatal exit, never at a third attempt.
+func TestRebuildRetryCannotLoop(t *testing.T) {
+	h := newRenderWatchHarness(t)
+	inputs := func() webviewErrorInputs {
+		return webviewErrorInputs{
+			rebuildInFlight:  h.r.rebuildInFlight,
+			rebuildRetryUsed: h.r.rebuildRetryUsed,
+		}
+	}
+
+	h.r.rebuildStarted()
+	if got := classifyWebviewError(inputs()); got != webviewErrorRetryRebuild {
+		t.Fatalf("first rebuild failure = %d, want a retry", got)
+	}
+	h.r.useRebuildRetry()
+
+	// The retry re-enters rebuildWebView, which re-asserts the flag.
+	h.r.rebuildStarted()
+	if got := classifyWebviewError(inputs()); got != webviewErrorFatalRuntime {
+		t.Fatalf("second rebuild failure = %d, want a fatal exit", got)
+	}
+}

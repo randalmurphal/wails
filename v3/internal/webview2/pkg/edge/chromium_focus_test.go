@@ -13,7 +13,8 @@ import (
 // CreateCoreWebView2ControllerCompleted has finished configuring the
 // controller. Focus() must be a safe no-op until IsReady() — previously it
 // dereferenced the nil/partially-initialised controller, and any COM error
-// routed through errorCallback, which exits the process.
+// routed through errorCallback, which the host's error policy treats as fatal
+// for a live window (and which used to exit the process outright).
 func TestFocusBeforeControllerReady(t *testing.T) {
 	e := NewChromium()
 	e.SetErrorCallback(func(err error) {

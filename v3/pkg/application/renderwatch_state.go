@@ -77,6 +77,13 @@ const (
 	// during boot is declared at roughly 60s + 20s rather than never.
 	renderFirstNavigationStandDownBudget = 60 * time.Second
 
+	// webviewRebuildRetryDelay is how long a failed controller rebuild waits
+	// before its one retry. Long enough for whatever transient condition
+	// broke the creation (a browser process still dying, a display
+	// transition) to pass, short enough that a user staring at the
+	// "rebuilding" indicator does not conclude the app is gone.
+	webviewRebuildRetryDelay = 2 * time.Second
+
 	// renderNonPongWarnStreak is how many consecutive non-pong ExecuteScript
 	// completions are tolerated quietly. A handful is ordinary (a reload
 	// discards whatever was in flight); a sustained run means every ping is
@@ -178,6 +185,19 @@ type renderRecoveryState struct {
 	episode       uint64
 	active        bool
 	navigateTimer *time.Timer
+
+	// rebuildInFlight spans a controller rebuild: set when rebuildWebView is
+	// entered, cleared by the navigation that commits into the controller it
+	// built. It is both what makes the host paint its "rebuilding" indicator
+	// (the window is otherwise blank for the duration, which is what invited
+	// a user to close it mid-rebuild) and what tells the error policy that a
+	// reported WebView2 error is a failed rebuild rather than a failed boot.
+	//
+	// rebuildRetryUsed caps recovery at one retry: it is set when a failed
+	// rebuild is retried and cleared only by a rebuild that succeeds, so a
+	// controller that cannot be built can never spin.
+	rebuildInFlight  bool
+	rebuildRetryUsed bool
 }
 
 // start brings the watchdog up. Reports false if it was already running, in
@@ -212,6 +232,10 @@ func (r *renderRecoveryState) stop() bool {
 	// never be rebuilt by a timer regardless.
 	r.stopNavigateTimer()
 	r.active = false
+	// The window is being destroyed: no rebuild is in flight any more, and no
+	// retry may be scheduled against it.
+	r.rebuildInFlight = false
+	r.rebuildRetryUsed = false
 	return true
 }
 
@@ -515,9 +539,41 @@ func (r *renderRecoveryState) hangDetected(now time.Time) (missed uint64, silent
 // navigationCommitted records that a navigation reached the renderer. That
 // both proves the renderer runs script and invalidates every ping issued
 // against the document being replaced, which nothing will answer now.
-func (r *renderRecoveryState) navigationCommitted(now time.Time) {
+//
+// Reports whether it ended a rebuild: a navigation committing IS the proof
+// that the rebuilt controller works, so it retires both the indicator and the
+// retry budget. The host repaints when that flips.
+func (r *renderRecoveryState) navigationCommitted(now time.Time) bool {
 	r.firstNavigationDone = true
 	r.resetPingDeadline(now)
+	if !r.rebuildInFlight {
+		return false
+	}
+	r.rebuildInFlight = false
+	r.rebuildRetryUsed = false
+	return true
+}
+
+// rebuildStarted records that the host is replacing the controller, and
+// reports whether that is a change (the host paints its indicator on the
+// transition). Deliberately does not touch rebuildRetryUsed: the retry IS a
+// second rebuild, and clearing the budget here would make it a loop.
+func (r *renderRecoveryState) rebuildStarted() bool {
+	if r.rebuildInFlight {
+		return false
+	}
+	r.rebuildInFlight = true
+	return true
+}
+
+// useRebuildRetry claims the single retry a recovery episode gets, reporting
+// false if it has already been spent.
+func (r *renderRecoveryState) useRebuildRetry() bool {
+	if r.rebuildRetryUsed {
+		return false
+	}
+	r.rebuildRetryUsed = true
+	return true
 }
 
 // controllerReplaced records that the host now points at a different
@@ -560,4 +616,66 @@ func (r *renderRecoveryState) endEpisode(now time.Time) bool {
 	// say nothing about it.
 	r.resetPingDeadline(now)
 	return true
+}
+
+// WebView2 error policy.
+//
+// edge.Chromium reports errors it cannot recover from itself and no longer
+// decides what happens next — it used to end every one of them with
+// os.Exit(1), which is how a user closing the window during a controller
+// rebuild (E_ABORT on the pending CreateCoreWebView2Controller) became a
+// silent process kill. The decision needs host state, and lives here.
+
+// webviewErrorInputs are the facts the disposition needs. Gathered by the
+// host at the moment the error is reported, never cached.
+type webviewErrorInputs struct {
+	// shuttingDown is true once the window is on its way out: the host called
+	// edge.Chromium.ShuttingDown, or the HWND is gone. Errors after that are
+	// teardown noise.
+	shuttingDown bool
+	// controllerReady is w.chromium.IsReady() — whether a usable controller
+	// exists right now. False during boot and between a failed creation and
+	// its replacement.
+	controllerReady bool
+	// rebuildInFlight and rebuildRetryUsed mirror renderRecoveryState.
+	rebuildInFlight  bool
+	rebuildRetryUsed bool
+}
+
+// webviewErrorDisposition is what the host should do about a reported error.
+type webviewErrorDisposition int
+
+const (
+	// webviewErrorIgnore: log it and carry on. The window is closing; there
+	// is nothing left to recover and nothing to tell the user about.
+	webviewErrorIgnore webviewErrorDisposition = iota
+	// webviewErrorRetryRebuild: rebuild the controller once more after a
+	// short delay. Only ever chosen when the retry budget is unspent.
+	webviewErrorRetryRebuild
+	// webviewErrorFatalStartup: no controller has ever come up for this
+	// window. The app cannot run without a webview, so this ends the process
+	// — visibly, never silently.
+	webviewErrorFatalStartup
+	// webviewErrorFatalRuntime: a controller was up and the view is now
+	// unusable — a rebuild that failed twice, or a fatal COM error on a live
+	// controller. Also ends the process visibly.
+	webviewErrorFatalRuntime
+)
+
+// classifyWebviewError applies the policy. The order is the argument: a
+// window that is going away outranks everything (a user closing it mid-rebuild
+// is a normal close, not a crash), then a rebuild with budget left is worth
+// one more attempt, and only then does the absence of a controller mean the
+// app never got off the ground.
+func classifyWebviewError(in webviewErrorInputs) webviewErrorDisposition {
+	switch {
+	case in.shuttingDown:
+		return webviewErrorIgnore
+	case in.rebuildInFlight && !in.rebuildRetryUsed:
+		return webviewErrorRetryRebuild
+	case in.rebuildInFlight || in.controllerReady:
+		return webviewErrorFatalRuntime
+	default:
+		return webviewErrorFatalStartup
+	}
 }

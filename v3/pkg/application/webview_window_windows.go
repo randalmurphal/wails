@@ -419,6 +419,10 @@ func (w *windowsWebviewWindow) run() {
 	if globalApplication.options.ErrorHandler != nil {
 		w.chromium.SetErrorCallback(globalApplication.options.ErrorHandler)
 	}
+	// Unconditional, unlike the reporting callback above: edge reports errors
+	// but no longer decides whether they end the process, so a window without
+	// this has no policy at all. See webviewErrorReported.
+	w.chromium.SetErrorPolicy(w.webviewErrorReported)
 
 	exStyle := w32.WS_EX_CONTROLPARENT
 	if options.BackgroundType != BackgroundTypeSolid {
@@ -527,7 +531,14 @@ func (w *windowsWebviewWindow) run() {
 		w.setSize(options.Width, options.Height)
 	}
 
-	w.setupChromium()
+	if !w.setupChromium() {
+		// A window with no webview has nothing to watch, show or register.
+		// The only way to reach here is the error policy declining to end the
+		// process, which it does exactly once: when the app is already closing
+		// (see webviewErrorReported).
+		globalApplication.error("webview2: window %v has no controller; abandoning its setup", w.parent.id)
+		return
+	}
 
 	// The watchdog outlives controller rebuilds — it always pings whichever
 	// controller w.chromium currently holds — so it is started here rather
@@ -1746,6 +1757,13 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 		}
 	case w32.WM_PAINT:
 		w.parent.emit(events.Windows.WindowPaint)
+		// While a controller rebuild is in flight there is no WebView2 child
+		// window covering the client area, so this is the only thing on
+		// screen — and a blank window for tens of seconds is what invited a
+		// user to close one mid-rebuild.
+		if w.paintRenderRecoveryIndicator() {
+			return 0
+		}
 	case w32.WM_ERASEBKGND:
 		w.parent.emit(events.Windows.WindowBackgroundErase)
 		// Paint the background with the configured colour so that areas not yet
@@ -2404,7 +2422,12 @@ func (w *windowsWebviewWindow) processRequest(
 	}
 }
 
-func (w *windowsWebviewWindow) setupChromium() {
+// setupChromium builds and configures this window's WebView2 controller. It
+// reports false when the controller never came up, in which case the caller
+// must not touch it: every COM call below the Embed would dereference a nil
+// webview. edge has already reported the failure to the error policy, which
+// owns whether the process survives it.
+func (w *windowsWebviewWindow) setupChromium() bool {
 	chromium := w.chromium
 	debugMode := globalApplication.isDebugMode
 
@@ -2415,7 +2438,7 @@ func (w *windowsWebviewWindow) setupChromium() {
 	)
 	if err != nil {
 		globalApplication.error("error getting WebView2 version: %w", err)
-		return
+		return false
 	}
 	globalApplication.capabilities = capabilities.NewCapabilities(webview2version)
 
@@ -2488,7 +2511,9 @@ func (w *windowsWebviewWindow) setupChromium() {
 		}
 	}
 
-	chromium.Embed(w.hwnd)
+	if !chromium.Embed(w.hwnd) {
+		return false
+	}
 
 	// Configure who owns the WebView2 rasterization scale on a monitor-DPI
 	// change. Two hosting modes need opposite answers:
@@ -2687,6 +2712,7 @@ func (w *windowsWebviewWindow) setupChromium() {
 		w.setURL(startURL)
 	}
 
+	return true
 }
 
 func (w *windowsWebviewWindow) fullscreenChanged(
@@ -3223,6 +3249,11 @@ func (w *windowsWebviewWindow) rebuildWebView(reason string) {
 	// out so a still-pending navigate deadline cannot fire into the controller
 	// the call is about to replace, and resets the watchdog for the cold start.
 	w.renderControllerReplaced("controller rebuilt")
+	// Everything below blocks the main thread until the new controller exists
+	// — tens of seconds in the worst case — with nothing on screen. Raise the
+	// indicator before the old controller goes away, so the window has an
+	// answer for every paint from here until the new one navigates.
+	w.renderRecovery.rebuildStarted()
 	// Captured before setupChromium, which navigates to options.URL and
 	// overwrites this. The two differ only when the app navigated at runtime
 	// without going through WebviewWindow.SetURL; when they agree, the
@@ -3239,11 +3270,20 @@ func (w *windowsWebviewWindow) rebuildWebView(reason string) {
 			}
 		}
 	}
+	// After the Close: until then the WebView2 child HWND covers the client
+	// area and the host's own painting is invisible.
+	w.repaintRenderRecoveryIndicator()
 	w.chromium = edge.NewChromium()
 	if globalApplication.options.ErrorHandler != nil {
 		w.chromium.SetErrorCallback(globalApplication.options.ErrorHandler)
 	}
-	w.setupChromium()
+	w.chromium.SetErrorPolicy(w.webviewErrorReported)
+	if !w.setupChromium() {
+		// The new controller never came up. webviewErrorReported has already
+		// decided what happens (one retry, or a visible exit); the indicator
+		// stays up across it. Nothing below may touch the dead controller.
+		return
+	}
 	if restoreURL != "" && restoreURL != w.lastNavigatedURL {
 		w.setURL(restoreURL)
 	}

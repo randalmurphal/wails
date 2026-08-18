@@ -4,6 +4,7 @@ package application
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"time"
 
@@ -93,7 +94,11 @@ func (w *windowsWebviewWindow) setWebviewSuspended(suspended bool) {
 // first-navigation stand-down, so the tick is re-armed at the short interval.
 func (w *windowsWebviewWindow) renderNavigationCommitted() {
 	w.endRenderRecovery("navigation completed")
-	w.renderRecovery.navigationCommitted(time.Now())
+	if w.renderRecovery.navigationCommitted(time.Now()) {
+		// The rebuilt controller has content: take the indicator down.
+		globalApplication.info("webview2: controller rebuild completed", "window", w.parent.id)
+		w.repaintRenderRecoveryIndicator()
+	}
 	w.restartRenderPingTimer()
 }
 
@@ -364,4 +369,168 @@ func (w *windowsWebviewWindow) renderRecoveryDeadlineExpired(episode uint64) {
 	}
 	w.rebuildWebView(fmt.Sprintf(
 		"renderer unresponsive; re-navigation did not commit within %s", renderRecoveryNavigateDeadline))
+}
+
+// WebView2 error policy — the host half of edge.Chromium.SetErrorPolicy.
+//
+// edge reports errors it cannot recover from itself and no longer decides
+// whether the process survives them; every one of them used to end in
+// os.Exit(1). The 2026-08-18 incident is what that costs: a rebuild triggered
+// by the escalation above had its CreateCoreWebView2Controller aborted with
+// E_ABORT (0x80004004) because the user closed the window while it ran, and
+// the app vanished. Closing a window is not a crash.
+//
+// The classification is in classifyWebviewError (renderwatch_state.go); this
+// carries it out.
+
+const (
+	webviewFatalStartupMessage = "The application could not start: its WebView2 view failed to initialise."
+	webviewFatalRuntimeMessage = "The WebView2 view stopped responding and could not be recovered. " +
+		"The application has to close."
+)
+
+// webviewErrorReported is installed on every Chromium this window owns. It
+// runs on the COM/main thread, where a modal message box is both safe and the
+// point: a fatal WebView2 failure must never be a silent vanish.
+func (w *windowsWebviewWindow) webviewErrorReported(err error) {
+	in := webviewErrorInputs{
+		shuttingDown:     w.webviewTearingDown(),
+		controllerReady:  w.chromium != nil && w.chromium.IsReady(),
+		rebuildInFlight:  w.renderRecovery.rebuildInFlight,
+		rebuildRetryUsed: w.renderRecovery.rebuildRetryUsed,
+	}
+	switch classifyWebviewError(in) {
+	case webviewErrorIgnore:
+		globalApplication.info("webview2: error during teardown, ignored",
+			"window", w.parent.id, "error", err.Error())
+	case webviewErrorRetryRebuild:
+		w.renderRecovery.useRebuildRetry()
+		globalApplication.error("webview2: controller rebuild failed for window %v (%v); retrying once in %s",
+			w.parent.id, err, webviewRebuildRetryDelay)
+		// Not inline: this fires from inside the failed creation, which is
+		// itself inside rebuildWebView's nested message pump. The retry has to
+		// start after that call has unwound.
+		time.AfterFunc(webviewRebuildRetryDelay, func() {
+			InvokeAsync(w.retryWebviewRebuild)
+		})
+	case webviewErrorFatalStartup:
+		w.fatalWebviewError(webviewFatalStartupMessage, err)
+	case webviewErrorFatalRuntime:
+		w.fatalWebviewError(webviewFatalRuntimeMessage, err)
+	}
+}
+
+// webviewTearingDown reports whether this window is on its way out, in which
+// case a reported error is teardown noise. Two independent facts, because
+// either can be true first: the host announces the teardown to the controller
+// (WM_CLOSE), and the HWND stops existing (WM_DESTROY and everything after).
+func (w *windowsWebviewWindow) webviewTearingDown() bool {
+	if w.chromium == nil || w.chromium.IsShuttingDown() {
+		return true
+	}
+	return w.hwnd == 0 || !w32.IsWindow(w.hwnd)
+}
+
+// retryWebviewRebuild runs the one retry a failed rebuild gets, on the main
+// thread. Everything it re-checks can have changed during the delay: the
+// window can have been closed, and the rebuild can have completed after all
+// (a creation error is not always terminal — the composition-hosting fallback
+// reports one and then succeeds on the HWND path).
+func (w *windowsWebviewWindow) retryWebviewRebuild() {
+	if w.webviewTearingDown() {
+		return
+	}
+	if !w.renderRecovery.rebuildInFlight {
+		globalApplication.debug("webview2: rebuild retry skipped; the controller recovered",
+			"window", w.parent.id)
+		return
+	}
+	w.rebuildWebView("retrying a controller rebuild that failed")
+}
+
+// fatalWebviewError ends the process the only defensible way: after telling
+// the user why. The message box blocks the main thread deliberately — the
+// alternative is the window disappearing with no explanation, which is the
+// behaviour this replaces.
+func (w *windowsWebviewWindow) fatalWebviewError(message string, err error) {
+	globalApplication.error("webview2: unrecoverable error for window %v: %s: %v",
+		w.parent.id, message, err)
+	owner := w.hwnd
+	if owner != 0 && !w32.IsWindow(owner) {
+		owner = 0
+	}
+	caption := globalApplication.options.Name
+	if caption == "" {
+		caption = "Application"
+	}
+	w32.MessageBox(owner, message+"\n\n"+err.Error(), caption, w32.MB_OK|w32.MB_ICONERROR)
+	os.Exit(1)
+}
+
+// The "rebuilding" indicator.
+//
+// A controller rebuild closes the old controller and blocks for as long as
+// the new one takes to create — ~22s in the incident, during which the window
+// showed nothing but its background colour and the user, reasonably,
+// concluded the app was dead and closed it. The child WebView2 HWND is gone
+// by then, so the host window's own WM_PAINT is visible and is all it takes
+// to say "still alive, wait".
+
+const renderRecoveryIndicatorText = "Renderer stopped responding — rebuilding the view…"
+
+// repaintRenderRecoveryIndicator asks for a repaint when the indicator flag
+// has just flipped, in either direction.
+func (w *windowsWebviewWindow) repaintRenderRecoveryIndicator() {
+	if w.hwnd == 0 {
+		return
+	}
+	w32.InvalidateRect(w.hwnd, nil, true)
+}
+
+// paintRenderRecoveryIndicator services WM_PAINT while a rebuild is in
+// flight, and reports whether it did — the caller falls through to the
+// default handling when it did not.
+func (w *windowsWebviewWindow) paintRenderRecoveryIndicator() bool {
+	if !w.renderRecovery.rebuildInFlight || w.hwnd == 0 {
+		return false
+	}
+	var ps w32.PAINTSTRUCT
+	hdc := w32.BeginPaint(w.hwnd, &ps)
+	if hdc == 0 {
+		return false
+	}
+	defer w32.EndPaint(w.hwnd, &ps)
+
+	// GetClientRect returns nil for a window in a transient state, and
+	// FillRect/DrawText on a nil rect crash. The paint is still consumed:
+	// BeginPaint has already validated the region.
+	rc := w32.GetClientRect(w.hwnd)
+	if rc == nil {
+		return true
+	}
+	col := w.parent.options.BackgroundColour
+	background := w32.COLORREF(uint32(col.Red) | uint32(col.Green)<<8 | uint32(col.Blue)<<16)
+	brush := w32.CreateSolidBrush(background)
+	w32.FillRect(hdc, rc, brush)
+	w32.DeleteObject(w32.HGDIOBJ(brush))
+
+	previousFont := w32.SelectObject(hdc, w32.GetStockObject(w32.DEFAULT_GUI_FONT))
+	defer w32.SelectObject(hdc, previousFont)
+	w32.SetBkMode(hdc, w32.TRANSPARENT)
+	w32.SetTextColor(hdc, indicatorTextColour(col))
+	text := w32.MustStringToUTF16(renderRecoveryIndicatorText)
+	w32.DrawText(hdc, text, -1, rc, w32.DT_CENTER|w32.DT_VCENTER|w32.DT_SINGLELINE|w32.DT_NOPREFIX)
+	return true
+}
+
+// indicatorTextColour picks black or white against the window's own
+// background colour, which is the only theming available here — the app's
+// stylesheet lives in the renderer that just died. Rec. 601 luma, the same
+// rule the Windows shell uses for accent-coloured text.
+func indicatorTextColour(background RGBA) w32.COLORREF {
+	luma := (299*uint32(background.Red) + 587*uint32(background.Green) + 114*uint32(background.Blue)) / 1000
+	if luma < 128 {
+		return w32.COLORREF(0x00FFFFFF)
+	}
+	return w32.COLORREF(0)
 }
