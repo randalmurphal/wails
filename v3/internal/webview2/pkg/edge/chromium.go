@@ -255,16 +255,21 @@ func (e *Chromium) pumpUntilInited(timeout time.Duration) bool {
 
 		// Wake on any queued message or when the deadline expires, whichever
 		// comes first. Unlike GetMessageW this cannot park indefinitely.
-		r, _, _ := w32.User32MsgWaitForMultipleObjects.Call(
-			0, 0, 0,
+		// MWMO_INPUTAVAILABLE is load-bearing: without it the wait ignores
+		// messages already in the queue at entry, so a completion posted
+		// between the drain below and this wait sleeps the full deadline.
+		// (Note the Ex signature has no fWaitAll parameter.)
+		r, _, _ := w32.User32MsgWaitForMultipleObjectsEx.Call(
+			0, 0,
 			uintptr(uint32(remaining.Milliseconds())),
 			w32.QS_ALLINPUT,
+			w32.MWMO_INPUTAVAILABLE,
 		)
 		if r == w32.WAIT_TIMEOUT {
 			continue // re-check inited once more, then fail on the deadline
 		}
 
-		// MsgWaitForMultipleObjects only signals that the queue is non-empty;
+		// MsgWaitForMultipleObjectsEx only signals that the queue is non-empty;
 		// it does not remove anything. Drain what is there before waiting again,
 		// or the next wait returns immediately on the same message.
 		for {
