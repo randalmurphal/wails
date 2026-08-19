@@ -499,6 +499,17 @@ func (e *Chromium) fallbackToCoreWebView2Controller(reason error) error {
 	return nil
 }
 
+// ReleaseCompositionResources drops the composition controller and the DComp
+// host targeting this Chromium's HWND. An HWND can carry only one DComp
+// target: while the old one exists, a replacement Chromium's composition
+// setup fails with DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED and silently
+// falls back to windowed hosting. A controller rebuild must call this on the
+// abandoned instance before creating its replacement.
+func (e *Chromium) ReleaseCompositionResources() {
+	e.releaseCompositionController()
+	e.releaseCompositionHost()
+}
+
 func (e *Chromium) releaseCompositionController() {
 	if e.compositionController4 != nil {
 		e.compositionController4.Release()

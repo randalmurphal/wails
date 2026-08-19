@@ -3238,6 +3238,12 @@ func (w *windowsWebviewWindow) rebuildWebView() {
 		return
 	}
 	globalApplication.info("webview2: rebuilding controller after browser process exit")
+	// The abandoned instance's DComp target stays bound to the HWND, and an
+	// HWND can only carry one: without this release the replacement fails
+	// composition setup with DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED and
+	// silently falls back to windowed hosting, so a WebView2CompositionHosting
+	// window would come back with the wrong hosting mode.
+	w.chromium.ReleaseCompositionResources()
 	w.chromium = w.newChromium()
 	w.setupChromium()
 }
