@@ -3209,7 +3209,16 @@ func (w *windowsWebviewWindow) processFailed(_ *edge.ICoreWebView2, args *edge.I
 	globalApplication.error("webview2: process failed (kind=%d); recovery attempt %d of %d",
 		kind, w.webviewRecoveryAttempts, maxWebviewRecoveryAttempts)
 
-	InvokeAsync(restore)
+	// Not InvokeAsync directly: it runs its function inline when already on
+	// the main thread, and this callback IS the main thread — WebView2
+	// delivers ProcessFailed through the message loop. Inline, the restore
+	// runs inside the event handler, where a new controller's creation
+	// callback is never delivered (Embed then times out, 0/8 in repeated
+	// browser-kill trials). The WebView2 docs require scheduling the work
+	// "to take place after completion of the event handler"; the goroutine
+	// hop forces dispatchOnMainThread to actually post, so the handler
+	// returns before the restore runs.
+	go InvokeAsync(restore)
 }
 
 // rebuildWebView replaces a dead WebView2 controller with a fresh one.
