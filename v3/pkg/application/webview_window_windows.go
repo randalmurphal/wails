@@ -3199,7 +3199,17 @@ func (w *windowsWebviewWindow) processFailed(_ *edge.ICoreWebView2, args *edge.I
 	globalApplication.error("webview2: process failed: kind=%s%s", kind, processFailureDetails(args))
 	switch kind {
 	case edge.COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED:
-		InvokeAsync(func() {
+		// The goroutine makes the InvokeAsync a genuine post. InvokeAsync
+		// inlines when already on the main thread, and this callback IS the
+		// main thread, so without it the rebuild runs inside the
+		// ProcessFailed COM handler — where a new controller's creation
+		// callback never arrives (hardware-validated on wails#6002: 0/8
+		// inline vs 8/8 posted). Embed's GetMessageW wait has no deadline,
+		// so the inline path is a permanent main-thread hang, not a slow
+		// recovery. WebView2 docs: "Do not run a message loop from within
+		// the event handler... Instead, schedule the appropriate work to
+		// take place after completion of the event handler."
+		go InvokeAsync(func() {
 			w.rebuildWebView("browser process exited")
 		})
 	case edge.COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED:
