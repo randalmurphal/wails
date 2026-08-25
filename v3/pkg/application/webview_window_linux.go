@@ -3,6 +3,7 @@
 package application
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -508,11 +509,15 @@ func (w *linuxWebviewWindow) hide() {
 	w.windowHide()
 }
 
-func (w *linuxWebviewWindow) showMenuBar()                      {}
-func (w *linuxWebviewWindow) hideMenuBar()                      {}
-func (w *linuxWebviewWindow) toggleMenuBar()                    {}
-func (w *linuxWebviewWindow) snapAssist()                       {} // No-op on Linux
-func (w *linuxWebviewWindow) suspendWebview()                   {} // No-op on Linux
+func (w *linuxWebviewWindow) showMenuBar()    {}
+func (w *linuxWebviewWindow) hideMenuBar()    {}
+func (w *linuxWebviewWindow) toggleMenuBar()  {}
+func (w *linuxWebviewWindow) snapAssist()     {} // No-op on Linux
+func (w *linuxWebviewWindow) suspendWebview() {} // No-op on Linux
+
+func (w *linuxWebviewWindow) callDevToolsProtocol(method, paramsJSON string, onCompleted func(errorCode uintptr, resultJSON string)) error {
+	return errors.New("CallDevToolsProtocol is Windows-only")
+}
 func (w *linuxWebviewWindow) resumeWebview()                    {} // No-op on Linux
 func (w *linuxWebviewWindow) setContentProtection(enabled bool) {}
 func (w *linuxWebviewWindow) setNonClientHitTestRegions([]nonClientHitTestRegion) {

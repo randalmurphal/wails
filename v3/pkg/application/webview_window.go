@@ -2,6 +2,7 @@ package application
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"runtime"
 	"slices"
@@ -115,6 +116,7 @@ type (
 		snapAssist()
 		suspendWebview()
 		resumeWebview()
+		callDevToolsProtocol(method, paramsJSON string, onCompleted func(errorCode uintptr, resultJSON string)) error
 		setContentProtection(enabled bool)
 		attachModal(modalWindow *WebviewWindow)
 		setNonClientHitTestRegions([]nonClientHitTestRegion)
@@ -528,6 +530,23 @@ func (w *WebviewWindow) ResumeWebview() Window {
 		InvokeSync(w.impl.resumeWebview)
 	}
 	return w
+}
+
+// CallDevToolsProtocol invokes one Chrome DevTools Protocol method (e.g.
+// "HeapProfiler.collectGarbage") against the window's webview. paramsJSON
+// is the method's parameter object as JSON ("" for parameterless methods).
+// onCompleted, when non-nil, is invoked at most once on the application's
+// main thread with the COM HRESULT (0 = success) and the CDP result JSON —
+// it must not block. The returned error covers dispatching only: nil means
+// the request reached the browser, not that it ran. Windows-only; other
+// platforms return an error.
+func (w *WebviewWindow) CallDevToolsProtocol(method, paramsJSON string, onCompleted func(errorCode uintptr, resultJSON string)) error {
+	if w.impl == nil || w.isDestroyed() {
+		return errors.New("window not created or already destroyed")
+	}
+	return InvokeSyncWithResult(func() error {
+		return w.impl.callDevToolsProtocol(method, paramsJSON, onCompleted)
+	})
 }
 
 func (w *WebviewWindow) SetURL(s string) Window {

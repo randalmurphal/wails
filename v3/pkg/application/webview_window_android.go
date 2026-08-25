@@ -3,6 +3,7 @@
 package application
 
 import (
+	"errors"
 	"fmt"
 	"unsafe"
 )
@@ -378,6 +379,10 @@ func (w *androidWebviewWindow) snapAssist() {
 
 func (w *androidWebviewWindow) suspendWebview() {
 	// Android has no WebView2 suspend equivalent
+}
+
+func (w *androidWebviewWindow) callDevToolsProtocol(method, paramsJSON string, onCompleted func(errorCode uintptr, resultJSON string)) error {
+	return errors.New("CallDevToolsProtocol is Windows-only")
 }
 
 func (w *androidWebviewWindow) resumeWebview() {

@@ -570,3 +570,7 @@ func (w *serverWebviewWindow) resumeWebview()                                   
 func (w *serverWebviewWindow) attachModal(modalWindow *WebviewWindow)              {}
 func (w *serverWebviewWindow) setContentProtection(enabled bool)                   {}
 func (w *serverWebviewWindow) setNonClientHitTestRegions([]nonClientHitTestRegion) {}
+
+func (w *serverWebviewWindow) callDevToolsProtocol(method, paramsJSON string, onCompleted func(errorCode uintptr, resultJSON string)) error {
+	return errors.New("CallDevToolsProtocol is not available in server mode")
+}

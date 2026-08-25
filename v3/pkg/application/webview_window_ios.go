@@ -16,6 +16,7 @@ void ios_window_set_background_color(void* viewController, unsigned char r, unsi
 */
 import "C"
 import (
+	"errors"
 	"unsafe"
 
 	"github.com/wailsapp/wails/v3/internal/assetserver"
@@ -437,6 +438,10 @@ func (w *iosWebviewWindow) snapAssist() {
 
 func (w *iosWebviewWindow) suspendWebview() {
 	// iOS has no WebView2 suspend equivalent
+}
+
+func (w *iosWebviewWindow) callDevToolsProtocol(method, paramsJSON string, onCompleted func(errorCode uintptr, resultJSON string)) error {
+	return errors.New("CallDevToolsProtocol is Windows-only")
 }
 
 func (w *iosWebviewWindow) resumeWebview() {

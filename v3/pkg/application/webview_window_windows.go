@@ -3118,6 +3118,13 @@ func (w *windowsWebviewWindow) suspendWebview() {
 	w.setWebviewSuspended(true)
 }
 
+// callDevToolsProtocol forwards one CDP method call to the webview. Runs
+// on the main thread via the public wrapper; the completion arrives later
+// on the same thread from WebView2's message pump.
+func (w *windowsWebviewWindow) callDevToolsProtocol(method, paramsJSON string, onCompleted func(errorCode uintptr, resultJSON string)) error {
+	return w.chromium.CallDevToolsProtocol(method, paramsJSON, onCompleted)
+}
+
 // resumeWebview resumes a suspended WebView2 and re-shows its surface.
 // Safe to call when not suspended (both steps are no-op successes), so
 // callers can invoke it unconditionally on window restore.

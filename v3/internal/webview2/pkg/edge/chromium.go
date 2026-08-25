@@ -90,6 +90,13 @@ type Chromium struct {
 	pendingScriptCompletions   map[*iCoreWebView2ExecuteScriptCompletedHandler]struct{}
 	pendingScriptCompletionsMu sync.Mutex
 
+	// pendingDevToolsCompletions keeps every in-flight CallDevToolsProtocol
+	// handler reachable from Go, for the same reason as
+	// pendingScriptCompletions: native code holds the pointer as a uintptr
+	// the GC does not see.
+	pendingDevToolsCompletions   map[*iCoreWebView2CallDevToolsProtocolMethodCompletedHandler]struct{}
+	pendingDevToolsCompletionsMu sync.Mutex
+
 	environment            *ICoreWebView2Environment
 	webview2RuntimeVersion string
 	compositionHost        *compositionHost
@@ -160,6 +167,7 @@ func NewChromium() *Chromium {
 	e.trySuspendCompleted = newICoreWebView2TrySuspendCompletedHandler(e)
 	e.containsFullScreenElementChanged = newICoreWebView2ContainsFullScreenElementChangedEventHandler(e)
 	e.pendingScriptCompletions = make(map[*iCoreWebView2ExecuteScriptCompletedHandler]struct{})
+	e.pendingDevToolsCompletions = make(map[*iCoreWebView2CallDevToolsProtocolMethodCompletedHandler]struct{})
 	/*
 		// Pinner seems to panic in some cases as reported on Discord, maybe during shutdown when GC detects pinned objects
 		// to be released that have not been unpinned.
@@ -975,6 +983,83 @@ func (e *Chromium) EvalWithCompletion(script string, onCompleted func(errorCode 
 		// look like a ping that was never sent, which is precisely the state
 		// the liveness watchdog must not mistake for "nothing to wait for".
 		e.releaseScriptCompletion(impl.handler)
+		return err
+	}
+	return nil
+}
+
+// devToolsCompletionHandler is a one-shot
+// ICoreWebView2CallDevToolsProtocolMethodCompletedHandler bound to a single
+// CallDevToolsProtocol call. One instance per call for the same reason as
+// scriptCompletionHandler: completions can interleave, and a shared callback
+// would deliver one consumer's result to another.
+type devToolsCompletionHandler struct {
+	chromium *Chromium
+	// handler is the COM object wrapping this impl — the pointer native code
+	// actually holds, and therefore the one
+	// Chromium.pendingDevToolsCompletions has to keep reachable.
+	handler     *iCoreWebView2CallDevToolsProtocolMethodCompletedHandler
+	onCompleted func(errorCode uintptr, resultJSON string)
+}
+
+func (h *devToolsCompletionHandler) QueryInterface(_, _ uintptr) uintptr { return 0 }
+
+// AddRef and Release are no-ops returning 1, as everywhere else in this
+// package: lifetime is owned Go-side by Chromium.pendingDevToolsCompletions.
+func (h *devToolsCompletionHandler) AddRef() uintptr  { return 1 }
+func (h *devToolsCompletionHandler) Release() uintptr { return 1 }
+
+// CallDevToolsProtocolMethodCompleted is invoked on the host's message loop
+// once the CDP call this handler was created for has completed.
+// returnObjectAsJson is owned by the caller, so it is copied out before
+// returning.
+func (h *devToolsCompletionHandler) CallDevToolsProtocolMethodCompleted(errorCode uintptr, returnObjectAsJson *uint16) uintptr {
+	h.chromium.releaseDevToolsCompletion(h.handler)
+	if h.onCompleted != nil {
+		h.onCompleted(errorCode, windows.UTF16PtrToString(returnObjectAsJson))
+	}
+	return 0
+}
+
+func (e *Chromium) retainDevToolsCompletion(h *iCoreWebView2CallDevToolsProtocolMethodCompletedHandler) {
+	e.pendingDevToolsCompletionsMu.Lock()
+	defer e.pendingDevToolsCompletionsMu.Unlock()
+	e.pendingDevToolsCompletions[h] = struct{}{}
+}
+
+func (e *Chromium) releaseDevToolsCompletion(h *iCoreWebView2CallDevToolsProtocolMethodCompletedHandler) {
+	e.pendingDevToolsCompletionsMu.Lock()
+	defer e.pendingDevToolsCompletionsMu.Unlock()
+	delete(e.pendingDevToolsCompletions, h)
+}
+
+// CallDevToolsProtocol invokes one Chrome DevTools Protocol method (e.g.
+// "HeapProfiler.collectGarbage") against the webview. paramsJSON is the
+// method's parameter object as JSON; "" is normalised to "{}", which
+// WebView2 requires for parameterless methods. onCompleted, when non-nil,
+// is invoked at most once on the host's message loop with the COM HRESULT
+// and the CDP result JSON. A nil error means the request was dispatched,
+// not that it ran; a non-nil error means it never reached the browser and
+// onCompleted will never be called. As with EvalWithCompletion, controller
+// teardown abandons pending handlers without completing them.
+func (e *Chromium) CallDevToolsProtocol(method, paramsJSON string, onCompleted func(errorCode uintptr, resultJSON string)) error {
+	if !e.IsReady() || e.webview == nil {
+		return errors.New("webview not ready")
+	}
+	if e.shuttingDown {
+		return errors.New("webview shutting down")
+	}
+	if paramsJSON == "" {
+		paramsJSON = "{}"
+	}
+	impl := &devToolsCompletionHandler{chromium: e, onCompleted: onCompleted}
+	impl.handler = newICoreWebView2CallDevToolsProtocolMethodCompletedHandler(impl)
+	e.retainDevToolsCompletion(impl.handler)
+	err := e.webview.CallDevToolsProtocolMethod(method, paramsJSON, impl.handler)
+	if err != nil && !errors.Is(err, windows.ERROR_IO_PENDING) {
+		// Only a hard failure means no completion will arrive;
+		// ERROR_IO_PENDING is the browser saying the request is in flight.
+		e.releaseDevToolsCompletion(impl.handler)
 		return err
 	}
 	return nil

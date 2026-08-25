@@ -323,6 +323,36 @@ func (i *ICoreWebView2) ExecuteScript(javascript string, handler *iCoreWebView2E
 	return nil
 }
 
+// CallDevToolsProtocolMethod dispatches one Chrome DevTools Protocol
+// method call against this webview (ICoreWebView2::CallDevToolsProtocolMethod).
+// parametersAsJson must be the method's parameter object as JSON — WebView2
+// rejects an empty string, so pass "{}" for parameterless methods. The CDP
+// result is delivered through handler on the host's message loop; the error
+// here only covers dispatching the request.
+func (i *ICoreWebView2) CallDevToolsProtocolMethod(methodName, parametersAsJson string, handler *iCoreWebView2CallDevToolsProtocolMethodCompletedHandler) error {
+	u16method, err := windows.UTF16PtrFromString(methodName)
+	if err != nil {
+		return err
+	}
+
+	u16params, err := windows.UTF16PtrFromString(parametersAsJson)
+	if err != nil {
+		return err
+	}
+
+	hr, _, _ := i.vtbl.CallDevToolsProtocolMethod.Call(
+		uintptr(unsafe.Pointer(i)),
+		uintptr(unsafe.Pointer(u16method)),
+		uintptr(unsafe.Pointer(u16params)),
+		uintptr(unsafe.Pointer(handler)),
+	)
+	if windows.Handle(hr) != windows.S_OK {
+		return windows.Errno(hr)
+	}
+
+	return nil
+}
+
 func (i *ICoreWebView2) GetSettings() (*ICoreWebViewSettings, error) {
 
 	var settings *ICoreWebViewSettings
