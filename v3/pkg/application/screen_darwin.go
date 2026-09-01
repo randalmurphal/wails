@@ -194,7 +194,10 @@ void* getWindowForSystray(void* nsStatusItem) {
 
 */
 import "C"
-import "unsafe"
+import (
+	"errors"
+	"unsafe"
+)
 
 func cScreenToScreen(screen C.Screen) *Screen {
 	// id and name are malloc'd copies made by processScreen (strdupOrNull);
@@ -307,9 +310,22 @@ func (m *macosApp) getScreens() ([]*Screen, error) {
 	return m.parent.Screen.GetAll(), nil
 }
 
+// cachedScreenForNativeScreen maps the physical values returned directly by
+// NSScreen back to the ScreenManager's laid-out DIP value. cScreenToScreen
+// deliberately prepares physical coordinates for LayoutScreens; returning it
+// directly would expose pixel-sized Bounds and WorkArea on Retina displays.
+func cachedScreenForNativeScreen(manager *ScreenManager, native *Screen) (*Screen, error) {
+	if manager != nil && native != nil {
+		if screen := manager.GetByID(native.ID); screen != nil {
+			return screen, nil
+		}
+	}
+	return nil, errors.New("screen not found")
+}
+
 func getScreenForWindow(window *macosWebviewWindow) (*Screen, error) {
 	cScreen := C.getScreenForWindow(window.nsWindow)
-	return cScreenToScreen(cScreen), nil
+	return cachedScreenForNativeScreen(globalApplication.Screen, cScreenToScreen(cScreen))
 }
 
 func getScreenForSystray(systray *macosSystemTray) (*Screen, error) {
@@ -317,5 +333,5 @@ func getScreenForSystray(systray *macosSystemTray) (*Screen, error) {
 	// https://stackoverflow.com/a/5875019/4188138
 	window := C.getWindowForSystray(systray.nsStatusItem)
 	cScreen := C.getScreenForWindow(window)
-	return cScreenToScreen(cScreen), nil
+	return cachedScreenForNativeScreen(globalApplication.Screen, cScreenToScreen(cScreen))
 }

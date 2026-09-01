@@ -42,7 +42,14 @@ void* windowNew(unsigned int id, int width, int height, bool fraudulentWebsiteWa
 	} else if (frameless) {
 		styleMask |= NSWindowStyleMaskFullSizeContentView;
 	}
-	WebviewWindow* window = [[WebviewWindow alloc] initWithContentRect:NSMakeRect(0, 0, width-1, height-1)
+	// Width and height are public window bounds, not content-view dimensions.
+	// Match windowSetSize by converting the requested outer frame to the
+	// corresponding content rect before constructing NSWindow. Passing the
+	// frame dimensions directly to initWithContentRect makes titled windows one
+	// title bar taller every time persisted bounds are restored.
+	NSRect requestedFrame = NSMakeRect(0, 0, width, height);
+	NSRect contentRect = [NSWindow contentRectForFrameRect:requestedFrame styleMask:styleMask];
+	WebviewWindow* window = [[WebviewWindow alloc] initWithContentRect:contentRect
 		styleMask:styleMask
 		backing:NSBackingStoreBuffered
 		defer:NO];
@@ -59,7 +66,7 @@ void* windowNew(unsigned int id, int width, int height, bool fraudulentWebsiteWa
 	delegate.windowId = id;
 
 	// Add NSView to window
-	NSView* view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width-1, height-1)];
+	NSView* view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, contentRect.size.width, contentRect.size.height)];
 	[view autorelease];
 
 	[view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
@@ -75,7 +82,7 @@ void* windowNew(unsigned int id, int width, int height, bool fraudulentWebsiteWa
 	}
 
 	// Embed wkwebview in window
-	NSRect frame = NSMakeRect(0, 0, width, height);
+	NSRect frame = NSMakeRect(0, 0, contentRect.size.width, contentRect.size.height);
 	WKWebViewConfiguration* config = [[WKWebViewConfiguration alloc] init];
 	[config autorelease];
 
@@ -153,7 +160,7 @@ void* windowNew(unsigned int id, int width, int height, bool fraudulentWebsiteWa
 	[webView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
 
 	if( enableDragAndDrop ) {
-		WebviewDrag* dragView = [[WebviewDrag alloc] initWithFrame:NSMakeRect(0, 0, width-1, height-1)];
+		WebviewDrag* dragView = [[WebviewDrag alloc] initWithFrame:NSMakeRect(0, 0, contentRect.size.width, contentRect.size.height)];
 		[dragView autorelease];
 
 		// The mask must be on the drag view itself: it was previously set on

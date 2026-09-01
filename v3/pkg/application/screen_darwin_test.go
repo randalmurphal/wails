@@ -8,6 +8,41 @@ import (
 	"unicode/utf8"
 )
 
+func TestCachedScreenForNativeScreenReturnsLaidOutDIPScreen(t *testing.T) {
+	native := &Screen{
+		ID:          "42",
+		Bounds:      Rect{Width: 2940, Height: 1912},
+		WorkArea:    Rect{Width: 2940, Height: 1846},
+		ScaleFactor: 2,
+	}
+	cached := &Screen{
+		ID:          native.ID,
+		Bounds:      Rect{Width: 1470, Height: 956},
+		WorkArea:    Rect{Width: 1470, Height: 923},
+		ScaleFactor: 2,
+	}
+	manager := &ScreenManager{screens: []*Screen{cached}}
+
+	got, err := cachedScreenForNativeScreen(manager, native)
+	if err != nil {
+		t.Fatalf("cachedScreenForNativeScreen: %v", err)
+	}
+	if got != cached {
+		t.Fatalf("got screen %p, want cached DIP screen %p", got, cached)
+	}
+	if got.WorkArea.Width != 1470 || got.WorkArea.Height != 923 {
+		t.Fatalf("WorkArea = %+v, want Retina-normalised 1470x923", got.WorkArea)
+	}
+}
+
+func TestCachedScreenForNativeScreenRejectsUncachedScreen(t *testing.T) {
+	manager := &ScreenManager{screens: []*Screen{{ID: "known"}}}
+
+	if _, err := cachedScreenForNativeScreen(manager, &Screen{ID: "unknown"}); err == nil {
+		t.Fatal("expected uncached native screen to return an error")
+	}
+}
+
 // TestScreenStringsSurviveAutoreleasePool guards against storing autoreleased
 // UTF8String buffers in the C Screen struct (#5556). getAllScreens runs inside
 // an explicit autorelease pool that drains before the structs reach Go, so the

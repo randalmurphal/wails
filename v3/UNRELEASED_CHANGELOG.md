@@ -23,6 +23,7 @@ After processing, the content will be moved to the main changelog and this file 
 
 ## Fixed
 <!-- Bug fixes -->
+- Fix restored macOS windows growing by the title-bar height and return DIP screen geometry from `Window.GetScreen()` on Retina displays
 
 ## Deprecated
 <!-- Soon-to-be removed features -->
