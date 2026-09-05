@@ -1,5 +1,14 @@
 # AI Agent Instructions for Wails v3
 
+## Native window event forwarding
+
+`WebviewWindowOptions.DisableWindowEventForwarding` is for shells with their
+own frontend transport. It skips only automatic window-event JavaScript;
+Go hooks/listeners and explicit `ExecJS`/custom events still work. Do not
+move its gate ahead of native callbacks. Even no-op `evaluateJavaScript`
+calls can reset WebKit transient activation between a mouse press and click
+(macOS clipboard incident, 2026-09-04).
+
 ## Issue Tracking with GitHub
 
 **IMPORTANT**: GitHub Issues and pull requests are the authoritative trackers for this project. Do not create a parallel local issue database or markdown task list.

@@ -1427,6 +1427,9 @@ func (w *WebviewWindow) DispatchWailsEvent(event *CustomEvent) {
 }
 
 func (w *WebviewWindow) dispatchWindowEvent(id uint) {
+	if w.options.DisableWindowEventForwarding {
+		return
+	}
 	// TODO: Make this more efficient by keeping a list of which events have been registered
 	// and only dispatching those.
 	jsEvent := &CustomEvent{

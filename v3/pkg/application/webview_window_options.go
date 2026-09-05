@@ -96,6 +96,12 @@ type WebviewWindowOptions struct {
 	// URL is the URL to load in the window.
 	URL string
 
+	// DisableWindowEventForwarding stops automatic native window events from
+	// being forwarded to JavaScript. Go event hooks and listeners still run.
+	// Enable this for shells that do not use Wails' frontend event runtime:
+	// even an unused evaluateJavaScript call can clear WebKit user activation.
+	DisableWindowEventForwarding bool
+
 	// DisableResize will disable the ability to resize the window.
 	DisableResize bool
 
