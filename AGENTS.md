@@ -1,5 +1,15 @@
 # AI Agent Instructions for Wails v3
 
+## Updater relaunch
+
+Update and rollback must preserve the application's launch arguments. Applications
+that consume one-use startup credentials can set `updater.Config.RelaunchArgs`
+to a durable launch mode; nil preserves the original arguments, while a non-nil
+empty slice clears them. Capture arguments before clearing helper environment
+variables, and clear those variables before every replacement or rollback launch.
+Never log arguments. Applications that dispatch CLI modes before `application.New`
+must call `updater.HandleHelperMode` at entry, before that dispatch.
+
 ## Native window event forwarding
 
 `WebviewWindowOptions.DisableWindowEventForwarding` is for shells with their

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -120,6 +121,7 @@ func (u *Updater) Init(cfg Config) error {
 	if cfg.Arch == "" {
 		cfg.Arch = runtime.GOARCH
 	}
+	cfg.RelaunchArgs = slices.Clone(cfg.RelaunchArgs)
 	u.cfg = &cfg
 	u.current = cfg.CurrentVersion
 	u.state = StateIdle
@@ -395,6 +397,10 @@ func (u *Updater) CheckAndInstall(ctx context.Context) error {
 func (u *Updater) Restart(_ context.Context) error {
 	u.mu.RLock()
 	staged := u.resolved
+	args := selfArguments()
+	if u.cfg != nil && u.cfg.RelaunchArgs != nil {
+		args = u.cfg.RelaunchArgs
+	}
 	u.mu.RUnlock()
 	if staged == "" {
 		return ErrNotReady
@@ -415,6 +421,7 @@ func (u *Updater) Restart(_ context.Context) error {
 		envHelperNew+"="+staged,
 		envHelperPID+"="+itoa(os.Getpid()),
 		envHelperLog+"="+logPath,
+		envHelperArgs+"="+encodeLaunchArgs(args),
 	)
 
 	cmd := newDetachedCommand(self)
@@ -441,22 +448,22 @@ func (u *Updater) DownloadedPath() string {
 
 // Window-sizing constants for the built-in template:
 //
-//  * upToDateWidth/Height — the small "compact" card used for Checking,
-//    Up-to-Date, and Error states. The default window opens at this size,
-//    so the most common flow (Check → Up-to-Date) involves zero visible
-//    resize: the window is already its target size the moment it appears.
+//   - upToDateWidth/Height — the small "compact" card used for Checking,
+//     Up-to-Date, and Error states. The default window opens at this size,
+//     so the most common flow (Check → Up-to-Date) involves zero visible
+//     resize: the window is already its target size the moment it appears.
 //
-//  * availableWidth/Height — the larger "full-flow" card with room for
-//    Markdown-rendered release notes, the progress bar, and the Restart
-//    & Apply primary action. The Updater grows the window into this size
-//    via WindowSizer when state transitions to Available / Downloading /
-//    Verifying / Installing / Ready, then shrinks back if a fresh check
-//    later returns Up-to-Date.
+//   - availableWidth/Height — the larger "full-flow" card with room for
+//     Markdown-rendered release notes, the progress bar, and the Restart
+//     & Apply primary action. The Updater grows the window into this size
+//     via WindowSizer when state transitions to Available / Downloading /
+//     Verifying / Installing / Ready, then shrinks back if a fresh check
+//     later returns Up-to-Date.
 const (
-	upToDateWidth     = 348
-	upToDateHeight    = 161
-	availableWidth    = 520
-	availableHeight   = 540
+	upToDateWidth   = 348
+	upToDateHeight  = 161
+	availableWidth  = 520
+	availableHeight = 540
 )
 
 // statesNeedingFullSize lists the states whose layout requires the larger

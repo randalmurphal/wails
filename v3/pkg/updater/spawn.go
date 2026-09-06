@@ -11,6 +11,8 @@ var selfExecutable = func() (string, error) {
 	return os.Executable()
 }
 
+var selfArguments = func() []string { return os.Args[1:] }
+
 // newDetachedCommand builds an exec.Cmd for the helper invocation. Stdio is
 // disconnected from the parent so the helper survives the parent's exit on
 // every platform. Held in a package-level var so tests can substitute a
