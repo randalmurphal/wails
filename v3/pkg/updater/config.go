@@ -2,6 +2,7 @@ package updater
 
 import (
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -10,6 +11,12 @@ type Config struct {
 	// CurrentVersion is the version currently running. Required.
 	// Pass the same string you use to tag releases (e.g. "1.2.3" — no "v" prefix).
 	CurrentVersion string
+
+	// RelaunchArgs replaces the running process's arguments after update or
+	// rollback. Nil preserves os.Args[1:]; an empty non-nil slice clears them.
+	// Useful when startup consumed a one-use invitation or temporary token.
+	// Arguments are copied at Init and never written to updater logs.
+	RelaunchArgs []string
 
 	// Providers are the update sources, tried in order. The first to return
 	// a release is used; if a provider returns (nil, nil) the Updater treats
@@ -62,6 +69,11 @@ func (c *Config) validate() error {
 	}
 	if c.CurrentVersion == "" {
 		return errors.New("updater: Config.CurrentVersion is required")
+	}
+	for _, arg := range c.RelaunchArgs {
+		if strings.ContainsRune(arg, '\x00') {
+			return errors.New("updater: RelaunchArgs cannot contain NUL")
+		}
 	}
 	if len(c.Providers) == 0 {
 		return errors.New("updater: Config.Providers must contain at least one Provider")

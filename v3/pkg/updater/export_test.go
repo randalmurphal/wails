@@ -2,6 +2,12 @@ package updater
 
 import "os/exec"
 
+func SetSelfArgumentsForTest(f func() []string) func() {
+	previous := selfArguments
+	selfArguments = f
+	return func() { selfArguments = previous }
+}
+
 // SetSelfExecutableForTest replaces the package-level selfExecutable
 // resolver for the duration of a test. Returns a restore function the
 // caller should defer.

@@ -1,6 +1,7 @@
 package updater
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +32,7 @@ const (
 	envHelperNew    = "WAILS_UPDATER_HELPER_NEW"    // path of the verified new artifact
 	envHelperPID    = "WAILS_UPDATER_HELPER_PID"    // parent PID to wait for
 	envHelperLog    = "WAILS_UPDATER_HELPER_LOG"    // optional log file path
+	envHelperArgs   = "WAILS_UPDATER_HELPER_ARGS"   // encoded original arguments; never log
 )
 
 // HandleHelperMode returns immediately when the current process was not
@@ -40,6 +42,8 @@ const (
 //
 // The Wails application package calls this from application.New so that
 // `app.Updater.Restart` works without users wiring anything by hand.
+// Applications that dispatch CLI modes before application.New should call
+// this at entry, before parsing arguments or opening application state.
 func HandleHelperMode() {
 	if os.Getenv(envHelperMode) != "1" {
 		return
@@ -51,8 +55,12 @@ func HandleHelperMode() {
 	}
 	pid, _ := strconv.Atoi(os.Getenv(envHelperPID))
 	logPath := os.Getenv(envHelperLog)
+	args, err := decodeLaunchArgs(os.Getenv(envHelperArgs))
+	if err != nil {
+		os.Exit(2) // Refuse malformed launch state before touching the installed app.
+	}
 
-	code := runHelperSwap(target, newPath, pid, logPath, waitForPID, osLauncher{})
+	code := runHelperSwap(target, newPath, pid, logPath, waitForPID, osLauncher{args: args})
 	os.Exit(code)
 }
 
@@ -66,26 +74,57 @@ type launcher interface {
 	launch(path string) error
 }
 
-type osLauncher struct{}
+type osLauncher struct{ args []string }
 
-func (osLauncher) launch(path string) error {
-	var cmd *exec.Cmd
-	if runtime.GOOS == "darwin" && filepath.Ext(path) == ".app" {
-		cmd = exec.Command("open", "-n", path)
-	} else {
-		cmd = exec.Command(path)
-	}
+func (l osLauncher) launch(path string) error {
+	cmd := relaunchCommand(path, l.args, runtime.GOOS)
 	// Detach: we are about to exit; the new process must not depend on us.
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
+	applyDetachAttrs(cmd)
 	return cmd.Start()
+}
+
+func relaunchCommand(path string, args []string, goos string) *exec.Cmd {
+	if goos == "darwin" && filepath.Ext(path) == ".app" {
+		openArgs := []string{"-n", path}
+		if len(args) != 0 {
+			openArgs = append(append(openArgs, "--args"), args...)
+		}
+		return exec.Command("open", openArgs...)
+	}
+	return exec.Command(path, args...)
+}
+
+// NUL-terminated fields preserve empty arguments and even non-UTF8 Unix paths.
+// Base64 keeps the separator out of the environment. Original argv cannot
+// contain NUL; an absent value remains compatible with older helper callers.
+func encodeLaunchArgs(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString([]byte(strings.Join(args, "\x00") + "\x00"))
+}
+
+func decodeLaunchArgs(raw string) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	data, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil || len(data) == 0 || data[len(data)-1] != 0 {
+		return nil, errors.New("invalid updater launch arguments")
+	}
+	return strings.Split(string(data[:len(data)-1]), "\x00"), nil
 }
 
 // runHelperSwap implements the actual swap logic. It is unexported and
 // dependency-injected so unit tests can drive every branch without process
 // spawning. Returns the exit code the helper should use.
 func runHelperSwap(target, newPath string, parentPID int, logPath string, wait processWaiter, l launcher) int {
+	// Both the replacement and every rollback launch must leave helper mode.
+	// All inputs (including args in the launcher) were captured before entry.
+	clearHelperEnv()
 	lg := openHelperLog(logPath)
 	defer lg.Close()
 
@@ -166,15 +205,6 @@ func runHelperSwap(target, newPath string, parentPID int, logPath string, wait p
 		}
 		return 13
 	}
-
-	// Strip our helper-mode sentinels from the environment before launching
-	// the new binary. exec.Command inherits the parent's env when cmd.Env is
-	// unset, so without this the relaunched app would see WAILS_UPDATER_HELPER
-	// still set, call HandleHelperMode at start-up, try to perform another
-	// swap against a path we've already cleaned up, and exit with code 11 —
-	// the visible effect being "user clicks Restart, app dies, never reopens."
-	// Discovered against wailsapp/updater-demo on macOS arm64.
-	clearHelperEnv()
 
 	if err := l.launch(target); err != nil {
 		lg.logf("launch new failed: %v — restoring backup", err)
@@ -348,7 +378,7 @@ func (h *helperLog) Close() {
 // binary so the launched process boots in normal mode instead of inheriting
 // our helper-mode sentinels.
 func clearHelperEnv() {
-	for _, k := range []string{envHelperMode, envHelperTarget, envHelperNew, envHelperPID, envHelperLog} {
+	for _, k := range []string{envHelperMode, envHelperTarget, envHelperNew, envHelperPID, envHelperLog, envHelperArgs} {
 		_ = os.Unsetenv(k)
 	}
 }
